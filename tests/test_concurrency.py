@@ -20,8 +20,7 @@ PAYLOAD = {"model": "demo", "messages": [{"role": "user", "content": "hi"}]}
 
 
 def make_settings(tmp_path, **kw) -> Settings:
-    return Settings(listen="127.0.0.1:8000", master_keys=["sk-test"], strategy="priority",
-                    retry=0, cooldown=1, db_path=str(tmp_path / "usage.sqlite3"),
+    return Settings(listen="127.0.0.1:8000", master_keys=["sk-test"], strategy="priority", cooldown=1, db_path=str(tmp_path / "usage.sqlite3"),
                     pricing={"demo": {"prompt": 1.0, "completion": 1.0}},
                     providers=[ProviderSpec(name="slow", base_url="http://mock/v1",
                                             keys=["k1"], models={"demo": "demo-x"},

@@ -25,11 +25,15 @@ class SessionStore:
     落盘＝<data>/runtime/dsm_sessions.json（重启不丢·原子写）。
     """
 
+    DEBOUNCE_S = 10.0             # 落盘去抖：高频 apply() 合并成一次原子写
+
     def __init__(self, path=None):
         self.path = path or os.path.join(sms_home(), "runtime", "dsm_sessions.json")
         self._lock = threading.Lock()
         self._mem: "OrderedDict[str, dict]" = OrderedDict()
         self._loaded = False
+        self._dirty = False
+        self._last_flush = 0.0
 
     def _load(self):
         if self._loaded:
@@ -68,20 +72,43 @@ class SessionStore:
             self._mem.move_to_end(k)
             while len(self._mem) > STATE_MAX_SESSIONS:
                 self._mem.popitem(last=False)
-            self._save()
+            self._mark_dirty()
             return full
 
     def reset(self, env):
         with self._lock:
             self._mem.pop(self.key(env), None)
-            self._save()
+            self._mark_dirty()
 
-    def _save(self):
+    def _mark_dirty(self):
+        self._dirty = True
+        now = _now()
+        # 去抖：距上次落盘 ≥ DEBOUNCE_S 才真正写盘，其余只标脏
+        if now - self._last_flush >= self.DEBOUNCE_S:
+            self._flush()
+
+    def _flush(self):
+        """真正原子写盘（调用方持锁）。强制出口＝close()/退出钩子。"""
         try:
             atomic_io.wjson(self.path, {"ts": int(_now()),
                                         "sessions": {k: v for k, v in self._mem.items()}})
+            self._dirty = False
+            self._last_flush = _now()
         except Exception as e:
             log.warning("dsm session state persist failed: %s", e)
+
+    def _save(self):
+        """兼容旧调用点：按去抖节奏决定真正写盘还是只标脏。"""
+        self._mark_dirty()
+
+    def _close(self):
+        self.close()
+
+    def close(self):
+        """退出/热重载收口：把脏水位一次性落盘。"""
+        with self._lock:
+            if self._dirty:
+                self._flush()
 
     def count(self):
         with self._lock:

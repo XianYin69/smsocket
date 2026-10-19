@@ -17,12 +17,15 @@ asset folder) ever handles it in full.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import time
 import uuid
 from pathlib import Path
 
 from .config import envv
+
+log = logging.getLogger("smssocket.identity")
 
 ID_FILE = "smsocket.identity"
 ENV_ID_FILE = "SMSSOCKET_IDENTITY_FILE"
@@ -66,8 +69,9 @@ def install_id(config_path: os.PathLike | str | None = None,
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(code + "\n", encoding="utf-8")
-    except OSError:
-        pass            # read-only media: the code still works for this process
+    except OSError as exc:
+        log.warning("install identity not persisted (%s): the code only lives in this process - "
+                    "extension pairing silently breaks on restart; fix the path's writability", exc)
     return code
 
 

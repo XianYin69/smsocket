@@ -9,21 +9,21 @@ Aero 拟物化改造：4 套可切换皮肤，右上角拟物拨杆切换，选�
 """
 
 _BASE = """
-*{box-sizing:border-box}
-body{font:14px/1.5 "Segoe UI",system-ui,-apple-system,sans-serif;margin:0;min-height:100vh;
- background:var(--bg);color:var(--fg);background-attachment:fixed}
+*{box-sizing:border-box;max-width:100%}
+body{font:14px/1.5 "Segoe UI",system-ui,-apple-system,sans-serif;margin:0;min-height:100vh;max-width:100%;overflow-x:hidden;
+  background:var(--bg);color:var(--fg);background-attachment:fixed}
 header{padding:12px 16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 14px 0;
  background:var(--glass);backdrop-filter:blur(var(--blur)) saturate(var(--sat));-webkit-backdrop-filter:blur(var(--blur)) saturate(var(--sat));
  border:1px solid var(--edge);border-radius:var(--rad);box-shadow:var(--drop),var(--bevel)}
 h1{font-size:17px;margin:0;font-weight:600;white-space:nowrap;text-shadow:var(--glow)}
-main{padding:14px 18px 34px;max-width:1220px;margin:0 auto;display:grid;grid-template-columns:1fr;gap:12px;align-items:start}
+main{padding:14px 18px 34px;width:100%;max-width:100%;margin:0 auto;display:grid;grid-template-columns:1fr;gap:12px;align-items:start;overflow-x:hidden}
 h2{font-size:12px;letter-spacing:.08em;margin:18px 0 6px;font-weight:700;color:var(--h2);text-shadow:var(--glow)}
 h3{font-size:11px;letter-spacing:.07em;margin:14px 0 5px;font-weight:600;color:var(--muted)}
 .extnote{font-size:11px;color:var(--muted);margin:0 0 4px}
-table{border-collapse:separate;border-spacing:0;width:100%;overflow:hidden;
- background:var(--glass);backdrop-filter:blur(var(--blur)) saturate(var(--sat));-webkit-backdrop-filter:blur(var(--blur)) saturate(var(--sat));
- border:1px solid var(--edge);border-radius:var(--rad);box-shadow:var(--drop),var(--bevel)}
-th,td{padding:6px 10px;text-align:left;font-size:13px}
+table{border-collapse:separate;border-spacing:0;width:100%;overflow-x:auto;display:block;
+  background:var(--glass);backdrop-filter:blur(var(--blur)) saturate(var(--sat));-webkit-backdrop-filter:blur(var(--blur)) saturate(var(--sat));
+  border:1px solid var(--edge);border-radius:var(--rad);box-shadow:var(--drop),var(--bevel)}
+th,td{padding:6px 10px;text-align:left;font-size:13px;white-space:nowrap}
 th{background:var(--th);color:var(--thfg);font-weight:700}
 td{border-bottom:1px solid var(--line)}
 tr:last-child td{border-bottom:0}
@@ -36,8 +36,8 @@ _BASE += """
  box-shadow:var(--drop),var(--bevel)}
 .card b{display:block;font-size:22px;font-weight:700;color:var(--num);text-shadow:var(--glow)}
 .card i{font-style:normal;font-size:11px;letter-spacing:.05em;opacity:.85}
-pre{padding:12px;overflow:auto;font:12px/1.6 ui-monospace,Consolas,monospace;white-space:pre-wrap;
- background:var(--well);border:1px solid var(--edge);border-radius:var(--rad);box-shadow:var(--inset)}
+pre{padding:12px;overflow-x:auto;overflow-y:auto;max-width:100%;font:12px/1.6 ui-monospace,Consolas,monospace;white-space:pre;
+  background:var(--well);border:1px solid var(--edge);border-radius:var(--rad);box-shadow:var(--inset)}
 input,button{font:inherit;color:var(--fg);border-radius:var(--rad);padding:6px 11px;border:1px solid var(--btnedge);
  background:var(--btn);box-shadow:var(--btnsh);cursor:pointer}
 #key{min-width:210px;background:var(--well);color:var(--fg);box-shadow:var(--inset),var(--bevel)}
@@ -65,6 +65,11 @@ tr.pmsub td,tr.pmcols td{padding:0 0 10px 22px;background:transparent;border:0}
 .pmchip.warn{background:var(--warn,rgba(220,170,60,.22));color:var(--warnfg,inherit)}
 .pmchip.off{opacity:.55;border-style:dashed}
 .pmchips{max-width:420px}
+.pmact{font-size:11px;padding:2px 8px}
+tr.pmadd td{padding:4px 22px 8px;background:transparent;border:0;border-top:1px dashed var(--edge)}
+.pmf{font:inherit;font-size:12px;padding:3px 6px;width:auto;min-width:120px;
+ background:var(--well);box-shadow:var(--inset);border:1px solid var(--edge);border-radius:var(--rad)}
+.pmemb{font-size:11px;display:inline-flex;align-items:center;gap:4px;margin-left:8px;opacity:.85}
 .side{display:contents}
 ::-webkit-scrollbar{width:15px;height:15px}
 ::-webkit-scrollbar-track{background:var(--track);border-radius:8px;box-shadow:var(--inset)}
@@ -207,7 +212,9 @@ _NET = """
 .netglyph:hover{opacity:.95}
 .netglyph.off{display:none}
 .hide{display:none}
-.reach td{padding:2px 6px;font-size:12px}
+.reach{display:block;overflow-x:auto;width:100%}
+.reach td{padding:2px 6px;font-size:12px;white-space:nowrap}
+.reach th{white-space:nowrap}
 .v-healthy{background:rgba(46,160,67,.22)}.v-slow{background:rgba(212,160,23,.22)}
 .v-blocked{background:rgba(226,68,68,.26)}.v-unstable{background:rgba(120,140,255,.22)}
 .v-unknown{opacity:.5}
@@ -351,31 +358,49 @@ async function loadConfig(){try{const [c,p]=await Promise.all([j('/admin/config'
 function mapParse(s){const o={};String(s||'').split(/[,;]+/).forEach(t=>{const i=t.indexOf('=');
  if(i>0)o[t.slice(0,i).trim()]=t.slice(i+1).trim()});return o}
 const lines=s=>String(s||'').split(String.fromCharCode(10)).map(x=>x.trim()).filter(Boolean);
+ const PRESETS={
+  opencode:{name:'opencode',url:'https://opencode.ai/zen/v1',style:'opencode',
+   models:'*',keyless:true,note:'OpenCode · 免费模型无需 Key；网关会伪装成 OpenCode CLI 的身份头以通过免费档门禁'},
+  kilocode:{name:'kilocode',url:'https://api.kilo.ai/api/gateway/v1',style:'openai',
+   models:'*',note:'Kilocode · Key 取自环境变量 KILOCODE_API_KEY；模型名 kilocode/<id>'},
+  openai:{name:'openai',url:'https://api.openai.com/v1',style:'openai',models:'',note:'OpenAI · Key 格式 sk-...'},
+  anthropic:{name:'anthropic',url:'https://api.anthropic.com',style:'anthropic',models:'',note:'Anthropic · Key 格式 sk-ant-...'}}
+ function applyPreset(k){const p=PRESETS[k];if(!p)return;
+  if(gv('p_name')&&!confirm('预置会覆盖当前名称/URL/协议，继续？'))return;
+  document.getElementById('p_name').value=p.name;
+  document.getElementById('p_url').value=p.url;
+  document.getElementById('p_style').value=p.style;
+  if(p.models)document.getElementById('p_models').value=p.models;
+  document.getElementById('p_preset_note').textContent=p.note||''}
 function formBody(){return {name:gv('p_name'),base_url:gv('p_url'),style:gv('p_style'),
- models:mapParse(gv('p_models')),embeddings:mapParse(gv('p_emb')),
- priority:+gv('p_prio')||0,weight:+gv('p_w')||1,timeout:+gv('p_to')||120,max_rpm:+gv('p_rpm')||0,
- enabled:document.getElementById('p_on').checked,
- auto:document.getElementById('p_auto').checked}}
+  models:mapParse(gv('p_models')),embeddings:mapParse(gv('p_emb')),
+  priority:+gv('p_prio')||0,weight:+gv('p_w')||1,timeout:+gv('p_to')||120,max_rpm:+gv('p_rpm')||0,
+  enabled:document.getElementById('p_on').checked,
+  auto:document.getElementById('p_auto').checked,
+  keyless:document.getElementById('p_keyless').checked}}
 function fillForm(p){['name|p_name','base_url|p_url','style|p_style'].forEach(x=>{const [k,id]=x.split('|');
- document.getElementById(id).value=p[k]||''});
- document.getElementById('p_models').value=Object.keys(p.models||{}).map(k=>k+'='+p.models[k]).join(',');
- document.getElementById('p_emb').value=Object.keys(p.embeddings||{}).map(k=>k+'='+p.embeddings[k]).join(',');
- document.getElementById('p_prio').value=p.priority;document.getElementById('p_w').value=p.weight;
- document.getElementById('p_to').value=p.timeout;document.getElementById('p_rpm').value=p.max_rpm||0;
- document.getElementById('p_on').checked=p.enabled!==false;
- document.getElementById('p_auto').checked=p.auto!==false;
- document.getElementById('p_keys').value=''}
+  document.getElementById(id).value=p[k]||''});
+  document.getElementById('p_models').value=Object.keys(p.models||{}).map(k=>k+'='+p.models[k]).join(',');
+  document.getElementById('p_emb').value=Object.keys(p.embeddings||{}).map(k=>k+'='+p.embeddings[k]).join(',');
+  document.getElementById('p_prio').value=p.priority;document.getElementById('p_w').value=p.weight;
+  document.getElementById('p_to').value=p.timeout;document.getElementById('p_rpm').value=p.max_rpm||0;
+  document.getElementById('p_on').checked=p.enabled!==false;
+  document.getElementById('p_auto').checked=p.auto!==false;
+  document.getElementById('p_keyless').checked=p.keyless===true;
+  document.getElementById('p_keys').value=''}
 function cancelEdit(){EDIT='';document.getElementById('pf').reset();
- document.getElementById('p_on').checked=true;
- document.getElementById('p_auto').checked=true;
- document.getElementById('p_submit').textContent='新增提供方';
- document.getElementById('p_note').textContent=''}
+  document.getElementById('p_on').checked=true;
+  document.getElementById('p_auto').checked=true;
+  document.getElementById('p_keyless').checked=false;
+  document.getElementById('p_submit').textContent='新增提供方';
+  document.getElementById('p_note').textContent=''}
 async function submitP(){const b=formBody();
- if(!b.name||!b.base_url){toast('名称与基础URL必填');return}
- try{if(EDIT){await send('/admin/providers/'+encodeURIComponent(EDIT),'PATCH',b);
-   toast('已更新提供方 '+EDIT);cancelEdit()}
+  if(!b.name||!b.base_url){toast('名称与基础URL必填');return}
+  if(b.keyless&&!b.keys){b.keys=['']}
+  try{if(EDIT){await send('/admin/providers/'+encodeURIComponent(EDIT),'PATCH',b);
+    toast('已更新提供方 '+EDIT);cancelEdit()}
   else{b.keys=lines(gv('p_keys'));await send('/admin/providers','POST',b);
-   toast('已新增提供方 '+b.name+' · 网关正在自动探测其模型');cancelEdit()}
+    toast('已新增提供方 '+b.name+' · 网关正在自动探测其模型');cancelEdit()}
   await loadConfig();await loadPM(true)}catch(e){toast('保存失败 · '+e.message)}}
 """
 JS += """
@@ -395,7 +420,7 @@ function editProv(n){const p=(CFG.providers||[]).filter(x=>x.name===n)[0];if(!p)
  document.getElementById('p_note').textContent='正在编辑：'+n+'（密钥请用下方按钮增删）';
  document.getElementById('pf').scrollIntoView({block:'center'})}
 async function saveGlobals(){const body={listen:gv('g_listen'),strategy:gv('g_strategy'),
- retry:+gv('g_retry')||0,cooldown:+gv('g_cd')||0,currency:gv('g_cur'),
+ cooldown:+gv('g_cd')||0,currency:gv('g_cur'),
  max_concurrency:+gv('g_maxc')||0,queue_wait:+gv('g_qw')||0,
  per_provider_concurrency:+gv('g_ppc')||0};
  const pr={};lines(gv('g_pricing')).forEach(t=>{const a=t.split('=');if(a.length===2){
@@ -415,7 +440,6 @@ function setSkin(k,save){if(!/[abcd]/.test(k))k='a';
 async function loadSettings(){try{const c=await j('/admin/config');CFG=c;
  document.getElementById('g_listen').value=c.listen||'';
  document.getElementById('g_strategy').value=c.strategy||'priority';
- document.getElementById('g_retry').value=c.retry;
  document.getElementById('g_cd').value=c.cooldown;
  document.getElementById('g_cur').value=c.currency||'USD';
  document.getElementById('g_maxc').value=c.max_concurrency||0;
@@ -431,8 +455,14 @@ async function loadSettings(){try{const c=await j('/admin/config');CFG=c;
 document.addEventListener('click',ev=>{const h=ev.target.closest('tr.pmhead');
  if(h&&!ev.target.closest('button')){togglePM(h.dataset.n);return}
  const b=ev.target.closest('button[data-a]');
- if(!b)return;const tr=b.closest('tr[data-n]');if(!tr)return;const n=tr.dataset.n;
- const a=b.dataset.a;
+ if(!b)return;const a=b.dataset.a;
+// 模型树里的按钮挂在 tr[data-p] 上（提供方名），不在 tr[data-n] 上
+if(a==='addmodel'||a==='delmodel'||a==='undeny'){const tr=b.closest('tr[data-p]');
+    if(!tr)return;const n=tr.dataset.p;
+    if(a==='addmodel')addModel(n);
+    else if(a==='undeny')undenyModel(n,b.dataset.u);
+    else delModel(n,b.dataset.m,b.dataset.u);return}
+ const tr=b.closest('tr[data-n]');if(!tr)return;const n=tr.dataset.n;
  if(a==='edit')editProv(n);
  else if(a==='key')addKeyTo(n);
  else if(a==='del')delProv(n);
@@ -584,37 +614,52 @@ function pmParams(m){
  else if(m.stream==='rejected')out+=pmChip('无流式','no');
  return out}
 function pmModelRow(n,m){
- const st=m.ok?pmChip('可用','ok'):(m.probed?pmChip('不可用','no'):pmChip('未探测','off'));
- const lat=m.probed?(Math.round(m.latency_ms||0)+' ms'):'-';
- const ctx=m.context?esc(m.context):'-';
- const al=m.alias?esc(m.alias)+' → '+esc(m.upstream):esc(m.upstream);
- const tag=(m.embed?pmChip('嵌入','muted'):'')+(m.published?'':pmChip('未发布','warn'));
- return '<tr class="pmrow" data-p='+esc(n)+'><td>'+al+' '+tag+'</td><td>'+st+'</td>'+
-  '<td>'+esc(lat)+'</td><td>'+esc(ctx)+'</td><td class="pmchips">'+pmParams(m)+'</td>'+
-  '<td class="muted">'+esc((m.error||'').slice(0,60))+'</td></tr>'}
+  const st=m.ok?pmChip('可用','ok'):(m.probed?pmChip('不可用','no'):pmChip('未探测','off'));
+  const lat=m.probed?(Math.round(m.latency_ms||0)+' ms'):'-';
+  const ctx=m.context?esc(m.context):'-';
+const al=m.alias?esc(m.alias)+' → '+esc(m.upstream):esc(m.upstream);
+    const tag=(m.embed?pmChip('嵌入','muted'):'')+(m.published?'':pmChip('未发布','warn'))+
+      (m.denied?pmChip('已拒绝','no'):'');
+    // 删除按钮：已拒绝的可取消拒绝；已发布的别名走 config 删除；
+    // 未发布（未拒绝）的探测缓存走缓存删除（同时记录拒绝，下次探测不再问）
+    const act=m.denied?'<button class=pmact data-a=undeny data-m='+(m.alias||m.upstream)+
+      ' data-u='+esc(m.upstream)+'>取消拒绝</button>':
+      (m.published?'<button class=pmact data-a=delmodel data-m='+(m.alias||m.upstream)+
+      '>删除别名</button>':'<button class=pmact data-a=delmodel data-m='+esc(m.upstream)+
+      ' data-u='+esc(m.upstream)+'>删除缓存</button>');
+  return '<tr class="pmrow" data-p='+esc(n)+'><td>'+al+' '+tag+'</td><td>'+st+'</td>'+
+   '<td>'+esc(lat)+'</td><td>'+esc(ctx)+'</td><td class="pmchips">'+pmParams(m)+'</td>'+
+   '<td class="muted">'+esc((m.error||'').slice(0,60))+'</td><td>'+act+'</td></tr>'}
 function pmProvRow(x){
- const on=!OPEN[x.name];
- const hd=x.model_count+' 个模型 · 可用 '+x.ok_models+
-  (x.probed_at?' · 探测于 '+new Date(x.probed_at*1000).toLocaleString():' · 尚未探测');
- const st=x.enabled?pmChip('启用','ok'):pmChip('停用','off');
- const err=x.error?' '+pmChip('探测报错','no'):'';
- const why=x.probe_note?' '+pmChip(x.probe_note,'off'):'';
- return '<tr class="pmhead'+(x.stale?' stale':'')+'" data-n='+esc(x.name)+'>'+
-  '<td><span class="pmcaret">'+(on?'▸':'▾')+'</span><b>'+esc(x.name)+'</b>'+st+err+'</td>'+
-  '<td>'+esc(x.base_url)+'</td><td>'+esc(x.style)+'</td><td>'+esc(x.key_count)+'</td>'+
-  '<td>'+esc(x.priority)+' / '+esc(x.weight)+'</td><td class="muted">'+esc(hd)+why+
-  '</td></tr>'}
+  const on=!OPEN[x.name];
+  const hd=x.model_count+' 个模型 · 可用 '+x.ok_models+
+   (x.probed_at?' · 探测于 '+new Date(x.probed_at*1000).toLocaleString():' · 尚未探测');
+  const st=x.enabled?pmChip('启用','ok'):pmChip('停用','off');
+  const err=x.error?' '+pmChip('探测报错','no'):'';
+  const why=x.probe_note?' '+pmChip(x.probe_note,'off'):'';
+  return '<tr class="pmhead'+(x.stale?' stale':'')+'" data-n='+esc(x.name)+'>'+
+   '<td><span class="pmcaret">'+(on?'▸':'▾')+'</span><b>'+esc(x.name)+'</b>'+st+err+'</td>'+
+   '<td>'+esc(x.base_url)+'</td><td>'+esc(x.style)+'</td><td>'+esc(x.key_count)+'</td>'+
+   '<td>'+esc(x.priority)+' / '+esc(x.weight)+'</td><td class="muted">'+esc(hd)+why+
+   '</td></tr>'}
 function paintPM(){
- const t=document.getElementById('pmtree');if(!t)return;
- if(!PM.length){t.innerHTML='<tr><td class=empty colspan=6>还没有提供方：在下方「新增 / 编辑提供方」添加，网关会自动探测其模型与参数</td></tr>';return}
- const hd='<tr><th>提供商</th><th>基础URL</th><th>协议</th><th>密钥</th><th>优先级/权重</th><th>模型概况</th></tr>';
- let out='';
- PM.forEach(x=>{out+=pmProvRow(x);
-  if(OPEN[x.name]){
-   if(!x.models.length)out+='<tr class="pmsub"><td colspan=6 class=empty>未列出模型 · 网关会自动探测</td></tr>';
-   else out+='<tr class="pmcols"><td colspan=6><table class="pmsub"><tr><th>模型（别名 → 真实名）</th><th>状态</th><th>延迟</th><th>上下文</th><th>参数（自动探测）</th><th>错误</th></tr>'+
-     x.models.map(m=>pmModelRow(x.name,m)).join('')+'</table></td></tr>'}});
- t.innerHTML=hd+out}
+  const t=document.getElementById('pmtree');if(!t)return;
+  if(!PM.length){t.innerHTML='<tr><td class=empty colspan=7>还没有提供方：在下方「新增 / 编辑提供方」添加，网关会自动探测其模型与参数</td></tr>';return}
+  const hd='<tr><th>提供商</th><th>基础URL</th><th>协议</th><th>密钥</th><th>优先级/权重</th><th>模型概况</th><th>操作</th></tr>';
+  let out='';
+  PM.forEach(x=>{out+=pmProvRow(x);
+   if(OPEN[x.name]){
+    if(!x.models.length)out+='<tr class="pmsub"><td colspan=7 class=empty>未列出模型 · 网关会自动探测</td></tr>';
+    else out+='<tr class="pmcols"><td colspan=7><table class="pmsub"><tr><th>模型（别名 → 真实名）</th><th>状态</th><th>延迟</th><th>上下文</th><th>参数（自动探测）</th><th>错误</th><th>操作</th></tr>'+
+      x.models.map(m=>pmModelRow(x.name,m)).join('')+
+      pmAddRow(x.name)+'</table></td></tr>'}})
+  t.innerHTML=hd+out}
+// 单条新增模型别名的小表单（挂在该提供方的模型子表末尾）
+function pmAddRow(n){return '<tr class="pmadd" data-p='+esc(n)+'>'+
+  '<td><input class="pmf" placeholder="别名" id="pm_a_'+esc(n)+'"></td>'+
+  '<td colspan=5><input class="pmf" placeholder="真实模型名（upstream）" id="pm_u_'+esc(n)+'">'+
+   '<label class="pmemb"><input type="checkbox" id="pm_e_'+esc(n)+'">嵌入模型</label></td>'+
+  '<td><button class=pmact data-a=addmodel>添加</button></td></tr>'}
 async function loadPM(auto){
  try{const d=await j('/admin/provider-models');PM=d.data||[];paintPM();
   const el=document.getElementById('pm_seen');
@@ -635,7 +680,37 @@ function pollPM(){
  ,1500)}
 function togglePM(n){OPEN[n]=!OPEN[n];paintPM()}
 async function clearPM(n){try{await send('/admin/models?provider='+encodeURIComponent(n||''),'DELETE');
- await loadPM(true)}catch(e){toast('清空失败 · '+e.message)}}
+  await loadPM(true)}catch(e){toast('清空失败 · '+e.message)}}
+async function addModel(n){const a=(document.getElementById('pm_a_'+n)||{}).value||'',
+  u=(document.getElementById('pm_u_'+n)||{}).value||'',
+  e=document.getElementById('pm_e_'+n);
+ if(!a||!u){toast('别名与真实名都必填');return}
+ try{await send('/admin/providers/'+encodeURIComponent(n)+'/models','POST',
+   {alias:a.trim(),upstream:u.trim(),embed:!!(e&&e.checked)});
+  toast('已为 '+n+' 添加模型 '+a.trim()+' · 网关正在探测');
+  await loadPM(true);await loadConfig()}catch(e){toast('添加模型失败 · '+e.message)}}
+async function delModel(n,m,u){
+  if(!m){toast('缺少模型标识');return}
+  if(u){
+    // 未发布的探测缓存：按 (provider, upstream) 删除缓存行并记录拒绝，
+    // 下一次自动探测不会再问这个 id（可由「取消拒绝」恢复）
+    if(!window.confirm('从 '+n+' 的探测缓存中删除模型 '+u+' ？\\n\\n'
+        +'删除后网关不会再探测这个模型；如需恢复请点「取消拒绝」'))return;
+    try{const r=await send('/admin/models/'+encodeURIComponent(n)+'/'+encodeURIComponent(u),'DELETE');
+      toast('已删除缓存 '+n+'/'+u+' · '+JSON.stringify(r.deleted)+' 行 · 已加入拒绝列表');
+      await loadPM(false);await loadConfig()}catch(e){toast('删除缓存失败 · '+e.message)}
+    return
+  }
+  if(!window.confirm('从 '+n+' 删除模型别名 '+m+' ？此操作写回 config.yaml'))return;
+  try{await send('/admin/providers/'+encodeURIComponent(n)+'/models/'+encodeURIComponent(m),'DELETE');
+   toast('已从 '+n+' 删除模型 '+m);await loadPM(false);await loadConfig()}
+  catch(e){toast('删除模型失败 · '+e.message)}}
+async function undenyModel(n,u){
+  if(!u){toast('缺少模型标识');return}
+  if(!window.confirm('取消对 '+n+'/'+u+' 的拒绝？\\n\\n取消后下一次探测会重新列出并探测这个模型'))return;
+  try{const r=await send('/admin/models/'+encodeURIComponent(n)+'/'+encodeURIComponent(u)+'/undeny','POST');
+   toast('已取消拒绝 '+n+'/'+u+' · '+JSON.stringify(r.cleared)+' 条');await loadPM(false)}
+  catch(e){toast('取消拒绝失败 · '+e.message)}}
 """
 JS += """
  (function(){let k='__SKIN__';try{k=localStorage.getItem(SKIN_KEY)||k}catch(e){}
@@ -769,16 +844,21 @@ function renderExts(d){const box=document.getElementById('x_list');if(!box)retur
    (it.version?'<span class="extchip">v'+esc(it.version)+'</span>':'')+'</h4>'+
    '<div class="extpath">'+esc(it.path)+'</div>'+
    (it.reason?'<p class="extchip bad">'+esc(it.reason)+'</p>':'')+
-   '<div class="btns"><button type="button" onclick="mountPanel(&#39;'+esc(it.name)+'&#39;)">刷新面板</button>'+
-   (it.verified?'':'<button type="button" onclick="pairPath(&#39;'+esc(it.name)+'&#39;)">配对并导入</button>')+
-   '<button type="button" onclick="removeExt(&#39;'+esc(it.name)+'&#39;)">卸载</button></div>'+
-   '<iframe id="pf-'+esc(it.name)+'" class="extpanel" title="'+esc(it.title||it.name)+' 自带面板"></iframe></div>'
+    '<div class="btns"><button type="button" onclick="mountPanel(&#39;'+esc(it.name)+'&#39;)" '+(ok?'':'disabled title="面板缺失，无法挂载"')+'>刷新面板</button>'+
+    (it.verified?'':'<button type="button" onclick="pairPath(&#39;'+esc(it.name)+'&#39;)">配对并导入</button>')+
+    '<button type="button" onclick="removeExt(&#39;'+esc(it.name)+'&#39;)">卸载</button></div>'+
+    (ok?'<iframe id="pf-'+esc(it.name)+'" class="extpanel" title="'+esc(it.title||it.name)+' 自带面板"></iframe>':'')+
+    (it.verified&&!ok?'<p class="extchip bad">自带面板缺失或过大，刷新无效</p>':'')+
+    '</div>'
   }).join('');
  items.forEach(it=>{XPATH[it.name]=it.path;if(it.verified&&it.panel_ready)mountPanel(it.name)})}
 async function mountPanel(name){const f=document.getElementById('pf-'+name);if(!f)return;
- try{const r=await fetch('/admin/extensions/'+encodeURIComponent(name)+'/panel',{headers:hdr()});
-  if(!r.ok)throw new Error('面板 '+r.status);f.srcdoc=await r.text()}
- catch(e){f.removeAttribute('srcdoc');xnote('自带面板挂载失败 · '+e.message)}}
+  try{const r=await fetch('/admin/extensions/'+encodeURIComponent(name)+'/panel',{headers:hdr()});
+   if(!r.ok)throw new Error('面板 '+r.status);
+   const txt=await r.text();
+   if(!/^[ \t]*(<!doctype|<html|<div|<style)/i.test(txt))throw new Error('面板内容不是 HTML');
+   f.srcdoc=txt}
+  catch(e){f.removeAttribute('srcdoc');xnote('自带面板挂载失败 · '+e.message)}}
 async function importExt(){const p=extPath();if(!p){xnote('请先填扩展程序路径');return}
  xnote('导入中…');try{const d=await send('/admin/extensions/import','POST',{path:p});
   xnote('识别码验证通过 · '+(d.item&&d.item.title||p)+' 的自带面板已挂到扩展程序条目');renderExts(d)}
@@ -851,7 +931,13 @@ BODY += """
 <table id="pmtree"></table>
 <h2>提供方操作（编辑 · 密钥增删 · 删除）</h2><table id="provs"></table>
 <h2>新增 / 编辑提供方</h2>
-<form id="pf" onsubmit="submitP();return false">
+ <div class="btns wide"><em>预置提供方（点按钮自动填入 URL/协议）</em>
+ <button type="button" onclick="applyPreset('opencode')">OpenCode</button>
+ <button type="button" onclick="applyPreset('kilocode')">Kilocode</button>
+ <button type="button" onclick="applyPreset('openai')">OpenAI</button>
+ <button type="button" onclick="applyPreset('anthropic')">Anthropic</button>
+ <span id="p_preset_note" class=muted></span></div>
+ <form id="pf" onsubmit="submitP();return false">
 <label>名称<input id="p_name" placeholder="my-provider"></label>
 <label>基础URL<input id="p_url" placeholder="https://api.xx.com/v1"></label>
 <label>协议<select id="p_style"><option value="openai">openai · 对话API</option>
@@ -863,6 +949,7 @@ BODY += """
 <label>超时(秒)<input id="p_to" type="number" value="120"></label>
 <label>最大RPM（0=不限）<input id="p_rpm" type="number" value="0"></label>
 <label>启用<input id="p_on" type="checkbox" checked></label>
+ <label>无密钥提供方<input id="p_keyless" type="checkbox"></label>
 <label class="wide">模型别名（别名=真实名,别名2=真实2）<input id="p_models" placeholder="gpt-x=gpt-4o-mini"></label>
 <label class="wide">嵌入模型（同上格式）<input id="p_emb"></label>
 <label class="wide">密钥（每行一个，仅新增时生效）<textarea id="p_keys" rows="3" placeholder="sk-..."></textarea></label>
@@ -887,7 +974,6 @@ BODY += """
 <label>监听地址<input id="g_listen"></label>
 <label>调度策略<select id="g_strategy"><option value="priority">priority</option>
 <option value="round_robin">round_robin</option><option value="weighted">weighted</option></select></label>
-<label>重试次数<input id="g_retry" type="number"></label>
 <label>冷却秒数<input id="g_cd" type="number"></label>
 <label>最大并发（0=不限）<input id="g_maxc" type="number" value="0"></label>
 <label>排队等待(秒)<input id="g_qw" type="number" value="30"></label>
@@ -1003,8 +1089,8 @@ BODY += """
 <em>样本</em><code id="r_rows">-</code>
 <button onclick="loadReach()">刷新</button>
 <button onclick="runReach()">立即探测</button></div>
-<table id="reach" class="reach"></table>
-<div class="muted">绿=健康 · 黄=慢 · 红=不通 · 蓝=抖动；行=模型，列=出口路径</div></div>
+  <table id="reach" class="reach"></table>
+  <div class="muted" style="overflow-x:auto;white-space:normal;word-break:break-all">绿=健康 · 黄=慢 · 红=不通 · 蓝=抖动；行=模型，列=出口路径</div></div>
 <h2>并行批量发送</h2>
 <form id="bf2" onsubmit="runBatch();return false">
 <label>并发数<input id="q_conc" type="number" value="8"></label>

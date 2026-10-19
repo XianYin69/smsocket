@@ -27,7 +27,7 @@ from SMSocket.gateway import create_app
 SMS_SCRIPTS = os.environ.get("SMS_CORE_SCRIPTS") or os.path.join(
     os.path.expanduser("~"), ".kilocode", "skills", "skill_manage_system",
     "skill", "scripts")
-CDM = os.path.join(SMS_SCRIPTS, "dsm.py")
+CDM = (os.environ.get("SMS_CORE_DSM") or os.path.join(SMS_SCRIPTS, "dsm.py"))
 
 
 def _load_client():
@@ -429,6 +429,10 @@ def test_I12_envelope_is_smaller_than_the_legacy_body_it_replaces(home, srv):
     legacy = json.dumps({"model": "demo", "messages": msgs, "tools": TOOLS},
                         ensure_ascii=False).encode("utf-8")
     _register(srv, home, store, env)
+    # Remove sms.schema_reg from chat envelope: it's only needed for schema
+    # registration, not for chat. The server looks up schema by sch from its store.
+    if "x" in env and "sms.schema_reg" in env["x"]:
+        del env["x"]["sms.schema_reg"]
     assert _chat(srv, env).status_code == 200
     wire = len(json.dumps(env, ensure_ascii=False).encode("utf-8"))
     assert wire < len(legacy), "信封没省字节 = 只是换了层皮"

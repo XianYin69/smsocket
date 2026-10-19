@@ -206,13 +206,20 @@ def _clean_msg(m, ids, on):
     if on("R7_drop_null_fields"):
         for k in [k for k, v in list(m.items()) if v in (None, "", [], {})]:
             m.pop(k)
+    # assistant 带 tool_calls 时 content 不可删：严格 OpenAI 兼容上游（sensenova/agnes-ai
+    # 等）对缺失 content 的 assistant 消息回 400 BadRequestError，工具循环整条断。
+    # R7 把 null/"" 的 content 删掉后，这里补回 ""，保证 content 字段始终在场。
+    if m.get("tool_calls") and "content" not in m:
+        m["content"] = ""
     for tc in (m.get("tool_calls") or []):
         if not isinstance(tc, dict):
             continue
         if on("R6_short_call_id") and tc.get("id"):
             tc["id"] = ids.put(tc["id"])
-        if on("R7_drop_null_fields") and tc.get("type") == "function":
-            tc.pop("type", None)                            # 唯一合法值＝默认值
+        # type:function 是协议面必填字段，不是可删的默认值——实测 sensenova/agnes-ai
+        # 等上游对缺失 type 的 tool_call 回 400 "invalid tool_call type"，工具循环整条断。
+        # R7 只删真正的空值字段；这里反过来确保 type 存在，而非删掉它。
+        tc.setdefault("type", "function")
         f = tc.get("function") or {}
         if on("R1_wire_compact") and isinstance(f.get("arguments"), str):
             f["arguments"] = _compact_inner(f["arguments"])
@@ -460,6 +467,8 @@ def semantic_signature(body):
     out = []
     for m in body.get("messages", []):
         c = m.get("content")
+        if c is None:                          # null 与 "" 对模型同义（assistant+tool_calls 无文本）
+            c = ""
         if isinstance(c, list):
             c = "\n".join(p.get("text", json.dumps(p, ensure_ascii=False, sort_keys=True))
                           if isinstance(p, dict) else str(p) for p in c)

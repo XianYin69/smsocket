@@ -69,13 +69,14 @@ async def auto_discover(st, names: list[str]) -> dict:
     """
     from .admin import apply_state
     cfg = st.settings.discover
-    out = {"providers": list(names), "added": [], "skipped": [], "assessed": False}
+    out = {"providers": list(names), "added": [], "skipped": [], "assessed": False,
+           "rpm_learned": {}}
     try:
         want = set(names)
         provs = [p for p in st.settings.providers if p.name in want]
         if not provs or st.http is None:
             return out
-        d = Discoverer(st.settings, st.http)
+        d = Discoverer(st.settings, st.http, st.catalog)
         kw = dict(models=None, test_prompt=TEST_PROMPT,
                   probe_params=cfg.probe_params, probe_stream=cfg.probe_stream,
                   probe_embeddings=False, concurrency=max(1, min(cfg.concurrency, 64)),
@@ -85,6 +86,18 @@ async def auto_discover(st, names: list[str]) -> dict:
                 rep = await d.probe_provider(p, **kw)
                 st.catalog.put(rep.get("models") or [])
                 out.setdefault("probed", []).append(p.name)
+                # A provider that just appeared has no learned RPM yet: fire a
+                # controlled burst so the sliding-window limiter learns the
+                # free-tier cap on its own.  Skipped when the config file
+                # already names a cap - an explicit number always wins.
+                if int(getattr(p, "max_rpm", 0) or 0) == 0:
+                    rl = await d.probe_rate_limit(
+                        p, burst=40, timeout=cfg.timeout,
+                        model=next(iter(p.models.values()), None) if p.models else None)
+                    out["rpm_learned"][p.name] = rl.get("max_rpm")
+                    if rl.get("max_rpm"):
+                        log.info("learned rpm cap %d for provider '%s'",
+                                 rl["max_rpm"], p.name)
             except Exception as e:                            # noqa: BLE001
                 log.warning("auto discover: probe of %s failed: %s", p.name, e)
         if cfg.apply_aliases:
@@ -131,8 +144,13 @@ def _tree(st) -> list:
     already in the config. A model that was never probed shows `probed: False`
     so the console can ask for a refresh instead of the operator pressing a
     button.
+
+    A model the operator rejected (deleted from the cache) is shown too, as a
+    `denied` row: the next freshness pass would otherwise re-list and re-probe
+    it, so the denial has to be visible and reversible from the same tree.
     """
     by = _by_provider(st)
+    denied = st.catalog.denied()
     out = []
     for p in st.settings.providers:
         rows = by.get(p.name, [])
@@ -145,6 +163,7 @@ def _tree(st) -> list:
             seen.add(str(upstream))
             models.append({
                 "alias": alias, "upstream": str(upstream), "published": True,
+                "denied": (p.name, str(upstream)) in denied,
                 "embed": False, "probed": bool(r),
                 "ok": bool(r and r.get("ok")), "status": (r or {}).get("status", 0),
                 "latency_ms": (r or {}).get("latency_ms", 0.0),
@@ -158,6 +177,7 @@ def _tree(st) -> list:
             seen.add(str(upstream))
             models.append({
                 "alias": alias, "upstream": str(upstream), "published": True,
+                "denied": (p.name, str(upstream)) in denied,
                 "embed": True, "probed": bool(r),
                 "ok": bool(r and r.get("ok")), "status": (r or {}).get("status", 0),
                 "latency_ms": (r or {}).get("latency_ms", 0.0),
@@ -169,11 +189,23 @@ def _tree(st) -> list:
                 continue
             models.append({
                 "alias": None, "upstream": mid, "published": False,
+                "denied": (p.name, mid) in denied,
                 "embed": str(r.get("embeddings") or "") == "supported",
                 "probed": True, "ok": bool(r.get("ok")), "status": r.get("status", 0),
                 "latency_ms": r.get("latency_ms", 0.0), "context": r.get("context"),
                 "params": r.get("params") or {}, "stream": r.get("stream") or "",
                 "error": r.get("error") or "", "ts": r.get("ts") or 0.0})
+        # a rejected id that has no cached row at all: still worth showing
+        for mid in sorted(m for (prov, m) in denied if prov == p.name):
+            if mid in seen:
+                continue
+            seen.add(mid)
+            models.append({
+                "alias": None, "upstream": mid, "published": False, "denied": True,
+                "embed": False, "probed": False, "ok": False, "status": 0,
+                "latency_ms": 0.0, "context": None, "params": {}, "stream": "",
+                "error": "operator rejected - skipped by the discoverer",
+                "ts": 0.0})
         out.append({
             "name": p.name, "base_url": p.base_url, "style": p.style,
             "enabled": bool(p.enabled), "key_count": len([k for k in p.keys if k]),
@@ -192,7 +224,7 @@ def _why_not(p) -> str:
     """Why the console cannot show measured parameters for this provider yet."""
     if not p.enabled:
         return "已停用，不参与自动探测"
-    if not [k for k in p.keys if k]:
+    if not [k for k in p.keys if k] and not getattr(p, "keyless", False):
         return "无密钥，无法自动探测"
     return ""
 
@@ -264,7 +296,8 @@ def _stale_names(st, max_age: float) -> list:
     want = []
     now = time.time()
     for p in st.settings.providers:
-        if not p.enabled or not [k for k in p.keys if k]:
+        if not p.enabled or (not [k for k in p.keys if k]
+                             and not getattr(p, "keyless", False)):
             continue
         newest, _ = _freshness(by.get(p.name, []))
         if not newest or now - newest > max_age:
@@ -344,6 +377,13 @@ def build(st, dep) -> APIRouter:
             rep = await d.probe_provider(p, progress=lambda r: _tick(r), **kw)
             st.progress["results"].append({k: v for k, v in rep.items() if k != "models"})
             st.catalog.put(rep["models"])
+            # Learn the provider's real RPM on the same pass, but only when the
+            # config has not pinned a cap by hand - an explicit number wins.
+            if int(getattr(p, "max_rpm", 0) or 0) == 0 and rep.get("ok"):
+                rl = await d.probe_rate_limit(p, burst=40, timeout=kw["timeout"],
+                                               model=next(iter(p.models.values()), None)
+                                               if p.models else None)
+                st.progress.setdefault("rpm", {})[p.name] = rl.get("max_rpm")
             return rep
         async def run_all():
             reps = await asyncio.gather(*[probe_one(p) for p in provs],
@@ -363,8 +403,11 @@ def build(st, dep) -> APIRouter:
             return {"accepted": True, "providers": [p.name for p in provs],
                     "poll": "/admin/discover/status"}
         report = await run_all()
-        return {"providers": report, "catalog": {"cached": len(st.catalog.all()),
-                                                 "last_seen": st.catalog.last_seen()}}
+        out = {"providers": report, "catalog": {"cached": len(st.catalog.all()),
+                                                "last_seen": st.catalog.last_seen()}}
+        if st.progress.get("rpm"):
+            out["rpm_learned"] = st.progress["rpm"]
+        return out
     def _tick(row) -> None:
         st.progress["done"] += 1
         st.progress["models"].append({"provider": row.provider, "model": row.model,
@@ -391,6 +434,35 @@ def build(st, dep) -> APIRouter:
     @r.delete("/admin/models")
     async def models_clear(provider: str = ""):
         return {"cleared": st.catalog.clear(provider), "provider": provider or "*"}
+
+    @r.delete("/admin/models/{provider}/{model}")
+    async def models_delete(provider: str, model: str):
+        """Delete one cached probe row - the console's "删除" on a 未发布 model.
+
+        The tree shows every id the gateway ever probed, including ones that were
+        never published as an alias (alias: null). Those rows live only in the
+        catalog; this route drops the single one the operator picked, without
+        touching the provider's config or any other cached model.
+
+        Dropping the row alone would not stop the next freshness pass from
+        re-listing and re-probing the same id, so the operator's rejection is
+        also recorded in `denied` - the discoverer skips those pairs until the
+        operator clears the denial with `POST /admin/models/{p}/{m}/undeny`.
+        """
+        n = st.catalog.delete(provider, model)
+        if not n:
+            raise HTTPException(404, detail={"error": {
+                "message": f"no cached probe for {provider}/{model}",
+                "type": "invalid_request_error"}})
+        st.catalog.deny(provider, model)
+        return {"ok": True, "deleted": n, "provider": provider, "model": model,
+                "denied": True}
+
+    @r.post("/admin/models/{provider}/{model}/undeny")
+    async def models_undeny(provider: str, model: str):
+        """Clear a denial so the next freshness pass may probe the id again."""
+        n = st.catalog.undeny(provider, model)
+        return {"ok": True, "cleared": n, "provider": provider, "model": model}
     @r.post("/admin/models/apply")
     async def models_apply(request: Request):
         """Publish probed models as aliases (adds only, never overwrites)."""

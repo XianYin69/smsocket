@@ -8,9 +8,10 @@ built-in dashboard.
 client (OpenAI SDK / curl / any app)
    │  POST /v1/chat/completions   Authorization: Bearer <master key>
    │  POST /v1/responses          the same, on the Responses API surface
+   │  POST /v1/messages           the same, on the Anthropic Messages surface
    ▼
 SMSocket ── key pool      (rotation, 401/429 cooldown, per-key max_rpm)
-           ── routing       (priority | round_robin | weighted, retry + failover)
+           ── routing       (priority | round_robin | weighted, cross-model failover)
            ── adapters      (openai chat  <->  openai responses  <->  anthropic)
            ── gate + meter  (max_concurrency, queueing, live in-flight)
            ── batch/async   (parallel send, background jobs)
@@ -194,6 +195,15 @@ retrieve, delete) is served even when the upstream only has chat completions, an
 a provider declared `style: openai-responses` serves `/v1/chat/completions` too.
 Streaming uses the Responses named events (`response.created`,
 `response.output_text.delta`, `response.completed`), not the chat sentinel.
+
+**A third surface: Anthropic Messages.** `POST /v1/messages` answers in Anthropic's shape
+(`system` + block `content` + `max_tokens` in, a `content` block list + `stop_reason` out,
+`message_start` / `content_block_delta` / `message_stop` over SSE) no matter what the
+upstream speaks — chat, responses or anthropic. An Anthropic-style client (opencode,
+kilocode) points its anthropic provider `baseURL` at this gateway and its API key at a
+master key, authenticated via `x-api-key` as well as `Authorization: Bearer`. `system`
+becomes a system message, `tool_result` becomes a `role: tool` message, `tool_use` becomes
+`tool_calls`; tool definitions and `tool_choice` map to OpenAI's function schema.
 
 **Weight and priority are measured, not typed.** `tune.enabled` (default on)
 ranks providers from the last window of *real conversations* plus the scheduled

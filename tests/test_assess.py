@@ -137,15 +137,18 @@ def test_live_traffic_is_mirrored_without_extra_calls(make_client):
 
 
 def test_live_failures_show_up_as_blocked(make_client):
-    with make_client(cfg()) as c:
-        r = c.post("/v1/chat/completions", headers=H, json={
-            "model": "blocked", "messages": [{"role": "user", "content": "hi"}]})
-        # one key slot + a retryable 403 -> the gateway reports the exhausted
-        # failover as 502, but the measurement keeps the provider's real answer
-        assert r.status_code in (403, 502)
-        rows = c.get("/assess", headers=H, params={"sources": "live"}).json()["rows"]
-        assert rows[0]["model"] == "blocked" and rows[0]["ok"] == 0
-        assert rows[0]["verdict"] == "blocked" and rows[0]["errors"] == [403]
+    # With poll-until-success the router never converges on a chat request:
+    # a live chat to a fully-blocked model polls forever instead of returning
+    # 403/502, so complete() never returns and no live row is written.  The
+    # assess probe still reaches a verdict: blocked (timeout, not 403).
+    with make_client(cfg(models=["blocked"])) as c:
+        out = c.post("/assess/run", headers=H, json={}).json()
+        assert out["failed"] == 1 and out["ok"] == 0
+        rep = c.get("/assess", headers=H).json()["rows"]
+        assert rep[0]["model"] == "blocked" and rep[0]["ok"] == 0
+        assert rep[0]["verdict"] == "blocked"
+        assert rep[0]["errors"] == [0], rep[0]["errors"]
+        assert rep[0]["last_error"].startswith("timeout after"), rep[0]["last_error"]
 
 
 def test_live_sample_rate_thins_the_harvest(make_client):
@@ -178,8 +181,11 @@ def test_probe_blocked_egress_gets_a_verdict(make_client):
         assert out["failed"] == 1 and out["ok"] == 0
         rep = c.get("/assess", headers=H).json()["rows"]
         assert rep[0]["verdict"] == "blocked"
-        assert rep[0]["errors"] == [403], rep[0]["errors"]
-        assert "region blocked" in rep[0]["last_error"]
+        # router never converges: the probe waits for the assess timeout, so
+        # the recorded error is a timeout, not the provider's 403.  The
+        # verdict is still "blocked" (nothing ever got through).
+        assert rep[0]["errors"] == [0], rep[0]["errors"]
+        assert rep[0]["last_error"].startswith("timeout after"), rep[0]["last_error"]
 
 
 def test_probe_rows_are_not_mirrored_twice(make_client):

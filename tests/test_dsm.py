@@ -297,6 +297,49 @@ def test_materialise_size_cap(app, tmp_path):
 
 
 # ---------- out=delta 必须把 reasoning 与 tool_calls 一起带出（尾巴3 前置） ----------
+def test_stream_resumes_after_provider_drop(tmp_path, monkeypatch):
+    """超长任务：提供商流式传输中途断开（httpx.ReadError）时，网关必须续接而非断流。
+
+    旧行为：`wrap_stream` 里 aiter_raw 抛 ReadError 直接穿透 → StreamingResponse 中断，
+    客户端拿到半截正文并把任务当作已收口（任务停止）。新行为：断流后把已吐正文作为
+    局部 assistant 消息续接重发（同槽优先、全池 failover），客户端最终收到两段拼出的全文；
+    续接请求必须带上完整历史，否则上下文只剩半截。"""
+    c = lambda o: "data: " + json.dumps(o) + "\n\n"
+    sent = []
+    n = {"calls": 0}
+
+    class DropStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield c({"choices": [{"index": 0, "delta": {"content": "先看"}}]}).encode()
+            raise httpx.ReadError("provider closed connection mid-stream")
+
+    def h(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        n["calls"] += 1
+        if n["calls"] == 1:
+            return httpx.Response(200, stream=DropStream())
+        return httpx.Response(200, stream=SSEStream([
+            c({"choices": [{"index": 0, "delta": {"content": "42"}}]}),
+            "data: [DONE]\n\n"]))
+
+    real, transport = httpx.AsyncClient, httpx.MockTransport(h)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: real(*a, transport=transport, **k))
+    with TestClient(create_app(make_settings(tmp_path, enabled=True))) as app:
+        r = app.post("/v1/dsm/chat", headers={**H, **CT},
+                     content=json.dumps(envelope(out="delta")))
+    assert r.status_code == 200, r.text
+    frames = [json.loads(x) for x in r.text.splitlines() if x.strip()]
+    text = "".join(f.get("answer") or "" for f in frames if isinstance(f.get("answer"), str))
+    assert text == "先看42", ("上游中断后续接失败，正文断裂", frames)
+    assert n["calls"] == 2, ("没有发生续接重发", n)
+    resume = sent[-1]
+    assert any(m.get("role") == "user" for m in resume["messages"]), \
+        ("续接请求丢失原始上下文", resume["messages"])
+    partial = [m for m in resume["messages"] if m.get("role") == "assistant"
+               and m.get("content") == "先看"]
+    assert partial, ("续接请求丢失已吐正文", resume["messages"])
+
+
 def test_out_delta_carries_reasoning_and_tool_calls(app):
     """旧实现只转 content 增量：思考整段消失、finish_reason 一律写 stop、tool_calls
     直接被吞——一旦把 dsm.out 切成 delta，SMS 的工具循环会当场断掉。
@@ -321,3 +364,54 @@ def test_out_delta_carries_reasoning_and_tool_calls(app):
     assert json.loads(tcs[0]["function"]["arguments"]) == {"cmd": "ls"}
     assert tcs[0]["id"] == "call_A"
     assert final["usage"]["out_reason"] == 9412      # 三分账在 delta 模式同样成立
+
+
+# ---------- smsocket 别名：DSM 路由与 legacy 路由同等待遇（自动路由） ----------
+def test_smsocket_alias_json_auto_routes(app):
+    """legacy /v1/chat/completions 一直支持 model='smsocket' 自动路由，
+    DSM 信封路由原先缺同款豁免：sms-core（dsm.enabled=true）发 'smsocket'
+    直接 404 unknown model，且客户端把 404 误判为「服务端无 DSM」进入 120s 冷却。"""
+    r = post_chat(app, envelope(x={"sms.model": "smsocket"}))
+    assert r.status_code == 200, r.text
+    assert SENT[-1]["model"] == "demo-up"        # 路由解析到真实模型
+    assert r.json()["model"] == "demo"           # 归因/计费用解析后的别名，而非 smsocket
+
+
+def test_smsocket_alias_delta_auto_routes(app):
+    r = post_chat(app, envelope(out="delta", x={"sms.model": "smsocket"}))
+    assert r.status_code == 200, r.text
+    assert SENT[-1]["model"] == "demo-up"
+    frames = [json.loads(l) for l in r.text.splitlines() if l.strip()]
+    assert frames[-1]["model"] == "demo"
+
+
+def test_auto_alias_json_auto_routes(app):
+    """auto 别名也应像 smsocket 一样触发自动路由（兼容 sms-core 默认 model=auto）。"""
+    r = post_chat(app, envelope(x={"sms.model": "auto"}))
+    assert r.status_code == 200, r.text
+    assert SENT[-1]["model"] == "demo-up"
+    assert r.json()["model"] == "demo"
+
+
+def test_auto_alias_delta_auto_routes(app):
+    r = post_chat(app, envelope(out="delta", x={"sms.model": "auto"}))
+    assert r.status_code == 200, r.text
+    assert SENT[-1]["model"] == "demo-up"
+    frames = [json.loads(l) for l in r.text.splitlines() if l.strip()]
+    assert frames[-1]["model"] == "demo"
+
+
+def test_smsocket_auto_alias_json_auto_routes(app):
+    """smsocket/auto 别名也应触发自动路由（兼容 sms-core 显式指定）。"""
+    r = post_chat(app, envelope(x={"sms.model": "smsocket/auto"}))
+    assert r.status_code == 200, r.text
+    assert SENT[-1]["model"] == "demo-up"
+    assert r.json()["model"] == "demo"
+
+
+def test_smsocket_auto_alias_delta_auto_routes(app):
+    r = post_chat(app, envelope(out="delta", x={"sms.model": "smsocket/auto"}))
+    assert r.status_code == 200, r.text
+    assert SENT[-1]["model"] == "demo-up"
+    frames = [json.loads(l) for l in r.text.splitlines() if l.strip()]
+    assert frames[-1]["model"] == "demo"

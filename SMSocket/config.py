@@ -28,10 +28,38 @@ def envv(name: str, default=None):
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
+_ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _env_file_fallback() -> dict:
+    """Values from SMSSOCKET_ENV_FILE (.env, KEY=VALUE lines) — used only for vars
+    the process doesn't already have, so an explicit launch environment always wins."""
+    env_file = os.environ.get("SMSSOCKET_ENV_FILE", "")
+    if not env_file or not Path(env_file).exists():
+        return {}
+    out = {}
+    for line in Path(env_file).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        out[k.strip()] = v.strip().strip("\"'")
+    return out
+
+
 def _env(v):
-    """Expand ${VAR} / $VAR from the environment (keeps secrets out of the file)."""
+    """Expand ${VAR} / $VAR from the environment, falling back to SMSSOCKET_ENV_FILE
+    (.env) for vars the process doesn't already have — a launch environment that
+    forgot to export AGNES_KEY_1 no longer silently produces a 0-key pool."""
+    fb = _env_file_fallback()
+
+    def _one(name):
+        val = os.environ.get(name)
+        if val is None:
+            val = fb.get(name, "")
+        return val
     if isinstance(v, str):
-        return _ENV_RE.sub(lambda m: os.environ.get(m.group(1) or m.group(2), ""), v)
+        return _ENV_RE.sub(lambda m: _one(m.group(1) or m.group(2)), v)
     if isinstance(v, list):
         return [_env(x) for x in v]
     if isinstance(v, dict):
@@ -56,6 +84,7 @@ class ProviderSpec:
     timeout: float = 120.0
     max_rpm: int = 0
     enabled: bool = True
+    keyless: bool = False          # provider needs no API key (OpenCode free models)
     extra_headers: dict[str, str] = field(default_factory=dict)
     embeddings: dict[str, str] = field(default_factory=dict)  # alias -> upstream embed model
     auto: bool = True                # participates in auto weight/priority tuning
@@ -152,7 +181,7 @@ def clash_from_raw(raw, default: ClashConfig | None = None) -> ClashConfig:
 
 
 
-PARK_REASONS = ("saturated", "rpm", "provider_saturated")
+PARK_REASONS = ("saturated", "rpm", "provider_saturated", "cooldown")
 STACK_POLICIES = ("lifo", "fifo", "priority")
 
 
@@ -170,7 +199,7 @@ class StackConfig:
     wait: float = 120.0                    # seconds a caller tolerates parking
     policy: str = "lifo"                   # lifo | fifo | priority
     park_on: list[str] = field(
-        default_factory=lambda: ["saturated", "rpm", "provider_saturated"])
+        default_factory=lambda: ["saturated", "rpm", "provider_saturated", "cooldown"])
     interval: float = 0.25                 # drain poll (seconds)
     repark: int = 3                        # batch retries after a 429
 
@@ -449,6 +478,7 @@ def tune_from_raw(raw, default: TuneConfig | None = None) -> TuneConfig:
 
 
 DSM_STYLES = ("openai-chat", "openai-responses", "anthropic")
+UPSTREAM_STYLES = ("openai", "openai-responses", "anthropic", "opencode")
 DSM_BUDGET_TIERS = ("low", "mid", "high")
 
 
@@ -470,6 +500,7 @@ class DSMConfig:
     max_materialize_bytes: int = 2_000_000
     budget_map: dict = field(default_factory=lambda: {"low": 1024, "mid": 4096, "high": 16384})
     require_registered_schema: bool = False
+    default_max_tokens: int = 0    # >0 时：DSM 请求未自带 max_tokens 即用此值兜底（防提供商低默认截断复杂任务）
 
     def serves_dsm(self) -> bool:
         return bool(self.enabled)
@@ -495,7 +526,8 @@ class DSMConfig:
                 "schema_store": self.schema_store,
                 "max_materialize_bytes": self.max_materialize_bytes,
                 "budget_map": dict(self.budget_map),
-                "require_registered_schema": self.require_registered_schema}
+                "require_registered_schema": self.require_registered_schema,
+                "default_max_tokens": self.default_max_tokens}
 
 
 def dsm_from_raw(raw, default: "DSMConfig | None" = None) -> DSMConfig:
@@ -532,7 +564,8 @@ def dsm_from_raw(raw, default: "DSMConfig | None" = None) -> DSMConfig:
         max_materialize_bytes=mb,
         budget_map=tiers or dict(base.budget_map),
         require_registered_schema=bool(raw.get("require_registered_schema",
-                                               base.require_registered_schema)))
+                                               base.require_registered_schema)),
+        default_max_tokens=max(0, int(raw.get("default_max_tokens", base.default_max_tokens) or 0)))
     return out
 
 
@@ -653,7 +686,6 @@ class Settings:
     listen: str = "127.0.0.1:8000"
     master_keys: list[str] = field(default_factory=list)
     strategy: str = "priority"     # priority | round_robin | weighted
-    retry: int = 2                 # extra attempts after first failure
     cooldown: float = 60.0         # seconds a dead key/provider is skipped
     db_path: str = "usage.sqlite3"
     log_level: str = "INFO"
@@ -708,7 +740,7 @@ class Settings:
                 idx.setdefault(alias, []).append(p)
         return idx
 
-_TOP = {"listen", "master_keys", "strategy", "retry", "cooldown", "db_path", "log_level"}
+_TOP = {"listen", "master_keys", "strategy", "cooldown", "db_path", "log_level"}
 
 
 def load_config(path: str | os.PathLike | None = None) -> Settings:
@@ -732,14 +764,18 @@ def load_config(path: str | os.PathLike | None = None) -> Settings:
             style=item.get("style", "openai"), weight=int(item.get("weight", 1)),
             priority=int(item.get("priority", 0)), timeout=float(item.get("timeout", 120.0)),
             max_rpm=int(item.get("max_rpm", 0)), enabled=bool(item.get("enabled", True)),
+            keyless=bool(item.get("keyless", False)),
             extra_headers=dict(_env(item.get("extra_headers") or {})),
             embeddings=dict(_env(item.get("embeddings") or {})),
             auto=bool(item.get("auto", True))))
+    for p in provs:
+        if p.style not in UPSTREAM_STYLES:
+            raise ValueError(
+                f"provider '{p.name}': style must be one of {UPSTREAM_STYLES}")
     settings = Settings(
         listen=raw.get("listen", Settings.listen),
         master_keys=[k for k in _env(raw.get("master_keys") or []) if k],
         strategy=raw.get("strategy", Settings.strategy),
-        retry=int(raw.get("retry", Settings.retry)),
         cooldown=float(raw.get("cooldown", Settings.cooldown)),
         db_path=raw.get("db_path", Settings.db_path),
         log_level=raw.get("log_level", Settings.log_level),

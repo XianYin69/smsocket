@@ -301,7 +301,7 @@ class Gate:
         """
         stack = self.stack
         if stack is not None and stack.parks_on("rpm") and provider \
-                and stack.rpm_blocked(provider):
+                and stack.rpm_blocked(provider, alias):
             return await self._park(alias, provider, "rpm",
                                     f"provider '{provider}' is rpm-limited", 1.0)
         sem = self._global_sem()

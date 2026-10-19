@@ -53,11 +53,14 @@ def mem_unsupported():
     return _mem_unsupported
 
 
-_DATA_DIR = os.environ.get("SMSOCKET_DATA") or os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = os.environ.get("SMSOCKET_DATA") or None
 
 
 def sms_home():
-    """服务端 runtime 根（SchemaStore/SessionStore 落盘处·可经 SMSOCKET_DATA 改）。"""
+    """服务端 runtime 根（SchemaStore/SessionStore 落盘处·可经 SMSOCKET_DATA 改）。
+
+    无 SMSOCKET_DATA 时返回 None：由 gateway.bind_dsm() 按 db_path.parent 统一接线。
+    """
     return _DATA_DIR
 
 

@@ -118,6 +118,33 @@ def test_key_pool_routes(client):
     assert c.delete("/admin/providers/Alpha/keys/0", headers=H()).status_code == 409
 
 
+def test_model_add_update_delete_routes(client):
+    c, cfg = client
+    # add a new chat alias on an existing provider
+    r = c.post("/admin/providers/Alpha/models", headers=H(),
+               json={"alias": "alpha-fast", "upstream": "alpha-fast-v1"})
+    assert r.status_code == 200, r.text
+    assert read_cfg(cfg)["providers"][0]["models"]["alpha-fast"] == "alpha-fast-v1"
+    assert "alpha-fast" in c.get("/v1/models", headers=H()).json()["data"][0]["id"] or \
+           "alpha-fast" in [m["id"] for m in c.get("/v1/models", headers=H()).json()["data"]]
+    # update the same alias (overwrite, not duplicate)
+    c.post("/admin/providers/Alpha/models", headers=H(),
+           json={"alias": "alpha-fast", "upstream": "alpha-fast-v2"})
+    assert read_cfg(cfg)["providers"][0]["models"]["alpha-fast"] == "alpha-fast-v2"
+    # add an embedding alias on a separate map
+    c.post("/admin/providers/Alpha/models", headers=H(),
+           json={"alias": "alpha-emb", "upstream": "alpha-embed-1", "embed": True})
+    assert read_cfg(cfg)["providers"][0]["embeddings"]["alpha-emb"] == "alpha-embed-1"
+    # delete the chat alias
+    assert c.delete("/admin/providers/Alpha/models/alpha-fast", headers=H()).status_code == 200
+    assert "alpha-fast" not in read_cfg(cfg)["providers"][0]["models"]
+    # deleting an unknown alias 404s
+    assert c.delete("/admin/providers/Alpha/models/ghost", headers=H()).status_code == 404
+    # bad input rejected
+    assert c.post("/admin/providers/Alpha/models", headers=H(),
+                  json={"alias": "", "upstream": "x"}).status_code == 400
+
+
 def test_delete_provider_guard(client):
     c, cfg = client
     assert c.delete("/admin/providers/Alpha", headers=H()).status_code == 409
@@ -130,11 +157,11 @@ def test_delete_provider_guard(client):
 def test_put_globals_and_pricing(client):
     c, cfg = client
     r = c.put("/admin/config", headers=H(), json={
-        "strategy": "round_robin", "retry": 5, "currency": "CNY",
+        "strategy": "round_robin", "currency": "CNY",
         "pricing": {"alpha-large": {"prompt": 1.0, "completion": 2.0}}})
     assert r.status_code == 200, r.text
     data = read_cfg(cfg)
-    assert data["strategy"] == "round_robin" and data["retry"] == 5
+    assert data["strategy"] == "round_robin"
     assert data["pricing"]["alpha-large"]["completion"] == 2.0
     assert data["providers"][0]["keys"] == ["sk-alpha-secret-1"]
     assert (cfg.parent / "config.yaml.bak").exists()

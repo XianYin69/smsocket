@@ -53,11 +53,14 @@ def mem_unsupported():
     return _mem_unsupported
 
 
-_DATA_DIR = os.environ.get("SMSOCKET_DATA") or os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = os.environ.get("SMSOCKET_DATA") or None
 
 
 def sms_home():
-    """服务端 runtime 根（SchemaStore/SessionStore 落盘处·可经 SMSOCKET_DATA 改）。"""
+    """服务端 runtime 根（SchemaStore/SessionStore 落盘处·可经 SMSOCKET_DATA 改）。
+
+    无 SMSOCKET_DATA 时返回 None：由 gateway.bind_dsm() 按 db_path.parent 统一接线。
+    """
     return _DATA_DIR
 
 
@@ -203,6 +206,7 @@ class SchemaStore:
         self.path = path or os.path.join(sms or sms_home(), "runtime", "dsm_schemas.json")
         self.by_hash = {}
         self._loaded = False
+        self._dirty = False
 
     def _load(self):
         if self._loaded:
@@ -216,19 +220,29 @@ class SchemaStore:
         return self.by_hash
 
     def _save(self):
+        """写盘：_dirty 为真才真正落盘（false＝幂等 no-op）。"""
         try:
+            if not self._dirty:
+                return True
             atomic_io.wjson(self.path, {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
                                         "schemas": self.by_hash})
+            self._dirty = False
             return True
         except Exception:
             return False
 
     def put(self, system, tools):
+        """O(1) 注册：内存更新 + 标脏，写盘由 flush() 批量收口（避免每帧一写）。"""
         blob = json.dumps({"s": system, "t": tools}, ensure_ascii=False, sort_keys=True)
         h = "sha1:" + hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
         self._load()[h] = {"system": system, "tools": tools, "bytes": len(blob.encode("utf-8"))}
-        self._save()
+        self._dirty = True
         return h
+
+    def flush(self):
+        """调用方（首帧登记出口 / 进程退出钩子）批量落盘；force 绕过 dirty 门。"""
+        self._dirty = True
+        return self._save()
 
     def get(self, h):
         return self._load().get(h)
@@ -365,8 +379,11 @@ def to_openai(env, store, alias=None):
     rec = _inline(env, store)
     mem = "" if (env.get("x") or {}).get("mem_off") else canon_mem(env.get("mem"), env.get("sid"))
     cons = canon_cons(env.get("cons"))
-    msgs = [{"role": "system", "content": rec["system"]}]
+    msgs = []
+    sys_txt = (rec["system"] or "").strip()
     tail = "\n".join(x for x in (mem, cons) if x)
+    if sys_txt:
+        msgs.append({"role": "system", "content": sys_txt})
     if tail:
         msgs.append({"role": "system", "content": tail})
     for t in env.get("d", []):
@@ -582,11 +599,15 @@ class SessionStore:
     落盘＝<data>/runtime/dsm_sessions.json（重启不丢·原子写）。
     """
 
+    DEBOUNCE_S = 10.0             # 落盘去抖：高频 apply() 合并成一次原子写
+
     def __init__(self, path=None):
         self.path = path or os.path.join(sms_home(), "runtime", "dsm_sessions.json")
         self._lock = threading.Lock()
         self._mem: "OrderedDict[str, dict]" = OrderedDict()
         self._loaded = False
+        self._dirty = False
+        self._last_flush = 0.0
 
     def _load(self):
         if self._loaded:
@@ -625,20 +646,43 @@ class SessionStore:
             self._mem.move_to_end(k)
             while len(self._mem) > STATE_MAX_SESSIONS:
                 self._mem.popitem(last=False)
-            self._save()
+            self._mark_dirty()
             return full
 
     def reset(self, env):
         with self._lock:
             self._mem.pop(self.key(env), None)
-            self._save()
+            self._mark_dirty()
 
-    def _save(self):
+    def _mark_dirty(self):
+        self._dirty = True
+        now = _now()
+        # 去抖：距上次落盘 ≥ DEBOUNCE_S 才真正写盘，其余只标脏
+        if now - self._last_flush >= self.DEBOUNCE_S:
+            self._flush()
+
+    def _flush(self):
+        """真正原子写盘（调用方持锁）。强制出口＝close()/退出钩子。"""
         try:
             atomic_io.wjson(self.path, {"ts": int(_now()),
                                         "sessions": {k: v for k, v in self._mem.items()}})
+            self._dirty = False
+            self._last_flush = _now()
         except Exception as e:
             log.warning("dsm session state persist failed: %s", e)
+
+    def _save(self):
+        """兼容旧调用点：按去抖节奏决定真正写盘还是只标脏。"""
+        self._mark_dirty()
+
+    def _close(self):
+        self.close()
+
+    def close(self):
+        """退出/热重载收口：把脏水位一次性落盘。"""
+        with self._lock:
+            if self._dirty:
+                self._flush()
 
     def count(self):
         with self._lock:

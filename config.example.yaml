@@ -6,7 +6,6 @@ master_keys:                    # client-facing keys ("sk-socket-..."); empty = 
                                   # (empty + no env -> a random key is minted into smsocket.key)
   - ${SMSSOCKET_MASTER_KEY}     # or the literal key; empty master_keys -> smsocket.key is minted
 strategy: priority              # priority | round_robin | weighted
-retry: 2                        # extra attempts after the first failure
 cooldown: 60                    # seconds a failing key is skipped
 db_path: usage.sqlite3          # call log for /stats + /v1/usage + dashboard
 currency: USD                   # legacy alias of billing.currency (billing: wins when present)
@@ -85,13 +84,31 @@ providers:
     embeddings:                  # optional: serve POST /v1/embeddings from this provider
       my-embeddings: text-embedding-3-small
 
-  - name: openai-compatible      # any OpenAI-shaped endpoint (DeepSeek, Moonshot, vLLM...)
-    base_url: https://api.deepseek.com/v1
-    keys:
-      - ${DEEPSEEK_API_KEY}
-    models:
-      deepseek-chat: deepseek-chat
-    priority: 5
+- name: openai-compatible      # any OpenAI-shaped endpoint (DeepSeek, Moonshot, vLLM...)
+     base_url: https://api.deepseek.com/v1
+     keys:
+       - ${DEEPSEEK_API_KEY}
+     models:
+       deepseek-chat: deepseek-chat
+     priority: 5
+
+   - name: opencode                # OpenCode AI Gateway · OpenAI-compatible（chat/completions）
+     base_url: https://opencode.ai/inference/openai/v1
+     style: openai
+     keys:
+       - ${OPENCODE_API_KEY}          # 控制台 → Keys → Add Service Account 生成（oc_sk-*）
+     keyless: true                  # 免费模型与 /v1/models 无需 Key；留空 keys 也照常探测
+     # models: 留空或写通配 `*` → 网关通过 /v1/models 实时取模型（自动探测）
+     priority: 8
+
+   - name: kilocode               # Kilocode AI Gateway · OpenAI-compatible
+     base_url: https://api.kilo.ai/api/gateway/v1
+     style: openai
+     keys:
+       - ${KILOCODE_API_KEY}         # 控制台 → API Keys 生成
+     models:
+       kilo/auto: kilo/auto          # 默认模型；其它 kilocode/<id> 按需追加
+     priority: 6
 
   - name: anthropic              # native Anthropic API, exposed as OpenAI chat format
     base_url: https://api.anthropic.com

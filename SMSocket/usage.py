@@ -43,7 +43,7 @@ def _verdict(rows: list[dict], ok_rows: list[dict], lat: list[float],
         return "unknown"
     if not ok_rows:
         bad = {int(r["status"] or 0) for r in rows}
-        if any(400 <= s < 500 for s in bad) or bad in ({0}, set()):
+        if any(400 <= s < 500 for s in bad) or bad == {0}:
             return "blocked"
         return "unstable"
     ratio = len(ok_rows) / len(rows)
@@ -58,8 +58,16 @@ def _verdict(rows: list[dict], ok_rows: list[dict], lat: list[float],
 class Usage:
     def __init__(self, path: str = "usage.sqlite3") -> None:
         self._lock = threading.Lock()
+        self._batched = 0
+        self._last_commit = time.time()
         self.con = sqlite3.connect(path, check_same_thread=False)
         self.con.row_factory = sqlite3.Row
+        # WAL mode lets concurrent readers coexist with the single writer; busy
+        # timeout makes SQLite wait/retry on lock contention instead of raising
+        # "database is locked" the moment two commits collide under load.
+        self.con.execute("PRAGMA journal_mode=WAL")
+        self.con.execute("PRAGMA busy_timeout=5000")
+        self.con.execute("PRAGMA synchronous=NORMAL")
         self.con.execute(SCHEMA)
         cols = {r["name"] for r in self.con.execute("PRAGMA table_info(calls)")}
         if "cost" not in cols:            # migrate v0.1 databases in place
@@ -101,7 +109,24 @@ class Usage:
         ph = ",".join("?" * len(row))
         with self._lock:
             self.con.execute(f"INSERT INTO calls({cols}) VALUES({ph})", list(row.values()))
-            self.con.commit()
+            self._batched += 1
+            # 批量提交：每批 20 条或满 1 秒才 fsync，批量负载下不再每调用一次落盘
+            if self._batched >= 20:
+                self.con.commit()
+                self._batched = 0
+                self._last_commit = time.time()
+            elif time.time() - self._last_commit > 1.0:
+                self.con.commit()
+                self._batched = 0
+                self._last_commit = time.time()
+
+    def flush(self) -> None:
+        """批量收口：把未满批的尾巴落盘（进程退出钩子调用）。"""
+        with self._lock:
+            if self._batched:
+                self.con.commit()
+                self._batched = 0
+                self._last_commit = time.time()
 
     def recent(self, n: int = 50) -> list[dict]:
         cur = self.con.execute("SELECT * FROM calls ORDER BY id DESC LIMIT ?", (n,))
@@ -263,4 +288,7 @@ class Usage:
 
     def close(self) -> None:
         with self._lock:
+            if self._batched:
+                self.con.commit()
+                self._batched = 0
             self.con.close()

@@ -51,7 +51,7 @@ def _reply_tool(request: httpx.Request) -> dict:
 
 
 def _settings(tmp_path, **kw) -> Settings:
-    return Settings(listen="127.0.0.1:0", master_keys=["sk-test"], retry=0,
+    return Settings(listen="127.0.0.1:0", master_keys=["sk-test"],
                     db_path=str(tmp_path / "usage.sqlite3"),
                     pricing={"demo": {"prompt": 2.0, "completion": 8.0, "currency": "USD"}},
                     providers=[ProviderSpec(name="m", base_url="http://mock/v1", keys=["k1"],
@@ -120,7 +120,7 @@ def test_egc_owns_the_outbound_bytes(live):
     assert wire == egc.serialize(body)                     # 出网字节＝EGC 的产物
     assert b"reasoning_content" not in wire                # 内部思考零泄漏
     assert b"temperature" not in wire and b"presence_penalty" not in wire   # R9
-    assert all("type" not in tc for m in body["messages"]     # R7 删调用面的唯一合法值
+    assert all(tc.get("type") == "function" for m in body["messages"]  # type 必填·不可删（实测上游 400）
                for tc in (m.get("tool_calls") or []))
     assert all(t.get("type") == "function" for t in body["tools"])   # 协议面一个都不动
     assert "\\u" not in wire.decode()                      # 内外层都无字面转义

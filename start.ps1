@@ -54,6 +54,16 @@ if ($Reload) { $argList += "--reload" }
 if ($NoKey) { $argList += "--no-key" }
 if ($RotateKey) { $argList += "--rotate-key" }
 
+$cfgPath = if ($Config) { $Config } else { "config.yaml" }
+if (Test-Path $cfgPath) {
+    $cfgText = Get-Content $cfgPath -Raw
+    $vars = [regex]::Matches($cfgText, '\$\{([A-Za-z_][A-Za-z0-9_]*)\}') | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -like '*_KEY*' } | Select-Object -Unique
+    $missing = @($vars | Where-Object { -not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($_, "User")) -eq $false -and -not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($_, "Machine")) -eq $false -and -not (Test-Path ("env:" + $_)) })
+    if ($missing.Count -gt 0) {
+        Write-Host "[warn] upstream key env var(s) not set in the launching environment: $($missing -join ', ') - the gateway will start with 0 usable keys and answer 503 on /v1/ until they are injected and smsocket is restarted"
+    }
+}
+
 $ShownPort = if ($Port) { $Port } else { 8000 }
 $cfgPath = if ($Config) { $Config } else { "config.yaml" }
 if (-not (Test-Path $cfgPath)) { Write-Host "[start] missing $cfgPath - copy config.example.yaml"; exit 1 }

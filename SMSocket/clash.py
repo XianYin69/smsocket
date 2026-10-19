@@ -311,7 +311,7 @@ class NetProbe:
             r = await client.head(url, timeout=to,
                                   headers={"user-agent": "SMSocket/net-probe"})
             ms = (time.perf_counter() - t0) * 1000
-            if r.status_code in (400, 404, 405, 501):   # HEAD refused -> GET
+            if r.status_code in (400, 401, 403, 404, 405, 501):   # HEAD refused -> GET
                 r = await client.get(url, timeout=to, headers={
                     "user-agent": "SMSocket/net-probe"})
                 ms = (time.perf_counter() - t0) * 1000

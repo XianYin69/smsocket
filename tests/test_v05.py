@@ -77,7 +77,7 @@ def handler(request: httpx.Request) -> httpx.Response:
 
 
 def _settings(tmp_path, providers=None, **kw):
-    return Settings(listen="127.0.0.1:8099", master_keys=[KEY], retry=0,
+    return Settings(listen="127.0.0.1:8099", master_keys=[KEY],
                     db_path=str(tmp_path / "usage.sqlite3"),
                     providers=providers or [
                         ProviderSpec(name="VendorX", base_url="http://mock/v1",

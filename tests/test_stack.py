@@ -5,6 +5,7 @@ same MockTransport trick as test_smoke.py. Note `StackScheduler.start()` creates
 a task, so it must happen *inside* a running loop - hence `with_stack()`.
 """
 import asyncio
+import time
 
 import httpx
 import pytest
@@ -212,6 +213,52 @@ def test_rpm_headroom_reads_the_key_window():
         return True
 
     assert asyncio.run(with_stack(max_conc=0)(body))
+
+
+# --------------------------------------------------------------- cooldown --
+def test_provider_cooling_flags_all_keys_in_cooldown():
+    prov = ProviderSpec(name="p", base_url="http://x/v1", keys=["k1", "k2"],
+                        models={"m": "m"})
+    pool = Pool([prov])
+
+    async def body(gate, sched, meter):
+        sched.pool = pool
+        assert sched.provider_cooling("p") is False
+        for s in pool.slots:
+            s.note_fail(cooldown=999.0)                   # both keys cooling
+        assert sched.provider_cooling("p") is True
+        assert sched.provider_cooling("other") is False   # unknown provider
+        pool.slots[0].dead_until = {}                   # one key recovers
+        assert sched.provider_cooling("p") is False        # not all cooling
+        return True
+
+    assert asyncio.run(with_stack(max_conc=0)(body))
+
+
+def test_wake_once_holds_a_cooling_provider_parked():
+    """A caller parked for `cooldown` is not woken while the provider is cold,
+    and goes through as soon as the last key leaves its cooldown window."""
+    prov = ProviderSpec(name="p", base_url="http://x/v1", keys=["k"],
+                        models={"m": "m"})
+    pool = Pool([prov])
+
+    async def body(gate, sched, meter):
+        sched.pool = pool
+        pool.slots[0].note_fail(cooldown=999.0)           # provider is cold
+        assert sched.provider_cooling("p") is True
+        # Park without waiting: push the entry, then probe wake_once directly.
+        entry = Parking(ts=time.time(), clock=time.perf_counter(), alias="m",
+                        provider="p", prio=0, event=asyncio.Event(),
+                        reason="cooldown", grab=False)
+        assert sched.stack.push(entry)
+        woke = await sched.wake_once()                    # cold: nobody may go
+        assert woke == 0 and len(sched.stack) == 1
+        pool.slots[0].dead_until = {}                    # cooldown expires
+        woke = await sched.wake_once()
+        assert woke == 1 and entry.granted is True        # woken, no grab held
+        return True
+
+    assert asyncio.run(with_stack(max_conc=0, wait=5.0)(body))
 
 
 # ----------------------------------------------------------------- grab ----

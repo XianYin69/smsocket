@@ -28,6 +28,13 @@ class BatchTooLarge(Exception):
     pass
 
 
+# The batch orchestrator bounds each item so one stuck model cannot hang the
+# whole batch.  The router itself never converges; this timeout only applies at
+# the batch layer.  A single chat call made directly against the router still
+# polls forever.
+BATCH_ITEM_TIMEOUT = 5.0
+
+
 @dataclass
 class Job:
     id: str
@@ -118,9 +125,22 @@ class BatchRunner:
                 tries = 0
                 while True:                   # a busy item re-joins the stack
                     try:
-                        body = await router.complete(item)
+                        body = await asyncio.wait_for(
+                            router.complete(item), timeout=BATCH_ITEM_TIMEOUT)
                         slot.update({"status": 200, "response": body,
                                      "usage": body.get("usage") or {}})
+                        break
+                    except asyncio.TimeoutError:
+                        # Router itself never converges (single chat keeps
+                        # polling), but the batch orchestrator must bound each
+                        # item so one stuck model cannot hang the whole batch.
+                        slot.update({"status": 504, "reparks": tries,
+                                     "error": {"message":
+                                               f"upstream did not answer within "
+                                               f"{BATCH_ITEM_TIMEOUT:.0f}s",
+                                               "type": "gateway_timeout"}})
+                        if fail_fast:
+                            stop.set()
                         break
                     except SMSocketBusy as e:
                         # A batch item is a patient client: park it instead of

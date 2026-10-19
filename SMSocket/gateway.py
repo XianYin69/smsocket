@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -31,7 +32,7 @@ from .admin import build as build_admin
 from .dashboard import PAGE
 from .extensions import build as build_extensions
 from .dsm_routes import build as build_dsm
-from .providers import Pool
+from .providers import Pool, is_auto_alias, resolve_auto_alias
 from .stacksched import StackScheduler
 from .router import NoUpstream, Router, UpstreamError
 from .usage import Usage
@@ -41,6 +42,7 @@ log = logging.getLogger("smssocket")
 CONSOLE_COOKIE = "sms_console"
 CONSOLE_TTL = 12 * 3600          # a console session is remembered for half a day
 RESPONSE_STORE_MAX = 200         # GET /v1/responses/{id} can read back this many
+RESPONSE_STORE_MAX_BYTES = 20 * 1024 * 1024   # ~20 MB 总闸：单条超限的整条丢弃
 LOOPBACK = {"127.0.0.1", "::1", "localhost", "testserver", "testclient"}
 
 
@@ -48,6 +50,15 @@ def _loopback(request) -> bool:
     """True for a browser on this machine (and TestClient in the tests)."""
     host = (request.client.host if getattr(request, "client", None) else "") or ""
     return host in LOOPBACK or host.startswith("127.")
+
+
+def _upstream_error(e: UpstreamError) -> dict:
+    """Error body for UpstreamError, including the optional machine code
+    (e.g. "resend" when the request was sent but never received a response)."""
+    err = {"message": str(e.detail), "type": "upstream_error"}
+    if e.code:
+        err["code"] = e.code
+    return err
 
 
 class State:
@@ -80,8 +91,9 @@ class State:
         self.tuner: AutoTuner | None = None
         # console sessions minted for a browser on this machine (token -> expiry)
         self.console: dict[str, float] = {}
-        # GET /v1/responses/{id} reads back from here (bounded, FIFO)
+        # GET /v1/responses/{id} reads back from here (bounded FIFO + byte cap)
         self.responses_store: dict[str, dict] = {}
+        self._responses_store_bytes = 0
 
     def build_stack(self) -> None:
         """(Re)create the parking lot and hand it to the gate.
@@ -269,6 +281,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if st.probe_task is not None:
             st.probe_task.cancel()
             st.probe_task = None
+        if st.usage is not None:
+            st.usage.flush()
+        # DSM 会话态去抖收口：脏水位落盘（热重载/停机两条路）
+        try:
+            if dsm._sessions is not None:
+                dsm._sessions.close()
+            if dsm._schemas is not None:
+                dsm._schemas.flush()
+        except Exception:
+            pass
         await st.http.aclose()
         st.usage.close()
         st.catalog.close()
@@ -288,8 +310,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         keys = st.settings.master_keys
         if not keys:
             return
-        token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-        token = token or request.query_params.get("api_key", "")
+        auth = request.headers.get("authorization", "").strip()
+        token = ""
+        m = re.match(r"(?i)^bearer\s+(.+)$", auth)
+        if m:
+            token = m.group(1).strip()
+        token = token or request.headers.get("x-api-key", "").strip() \
+            or request.query_params.get("api_key", "")
         if token in keys:
             return
         # a browser on this machine gets a cookie when it opens the console,
@@ -343,11 +370,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(400, detail={"error": {
                 "message": f"item {bad[0]} needs a model", "type": "invalid_request_error"}})
         unknown = sorted({str(it.get("model")) for it in items
-                          if isinstance(it, dict) and str(it.get("model") or "") not in known})
+                          if isinstance(it, dict) and str(it.get("model") or "") not in known
+                          and not is_auto_alias(str(it.get("model") or ""))})
         if unknown:
             raise HTTPException(404, detail={"error": {
                 "message": "unknown model(s): " + ", ".join(unknown),
                 "type": "invalid_request_error"}})
+        # Resolve `auto` items the same way the single-call routes do, so a fan
+        # out of N auto lanes spreads across providers instead of 404'ing.
+        for it in items:
+            a = str(it.get("model") or "")
+            if is_auto_alias(a):
+                picked = resolve_auto_alias(st.pool, st.settings.strategy, a)
+                if not picked:
+                    raise HTTPException(503, detail={"error": {
+                        "message": "no models available", "type": "server_error"}})
+                it["model"] = picked
         conc = int(body.get("concurrency", 8) or 8)
         if not 1 <= conc <= 256:
             raise HTTPException(400, detail={"error": {
@@ -440,6 +478,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                        "post a DSM envelope to /v1/dsm/chat or set dsm.openai_compat: true",
             "type": "legacy_disabled", "code": "dsm_openai_compat_false"}})
 
+    def _resolve_auto_alias(alias: str, idx: dict) -> str:
+        """Resolve 'smsocket'/'auto'/'smsocket/auto' by provider ranking.
+
+        The pick goes through Pool.auto_alias so it respects priority, weight,
+        autotune overrides and cooldown state. Returning the first alias of the
+        first provider in config.yaml (the old behaviour) pinned every `auto`
+        request onto one provider forever, and autotune then kept reinforcing
+        that provider because it alone saw any traffic.
+        """
+        if not is_auto_alias(alias):
+            return alias
+        if not idx:
+            raise HTTPException(503, detail={"error": {"message": "no models available",
+                                                        "type": "server_error"}})
+        picked = resolve_auto_alias(st.pool, st.settings.strategy, alias)
+        if not picked:
+            raise HTTPException(503, detail={"error": {"message": "no models available",
+                                                        "type": "server_error"}})
+        return picked
+
     @app.post("/v1/chat/completions", dependencies=dep)
     async def chat(request: Request):
         legacy_closed()
@@ -447,10 +505,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         alias = str(payload.get("model") or "")
         if not alias:
             raise HTTPException(400, detail={"error": {"message": "model is required",
-                                                       "type": "invalid_request_error"}})
-        if alias not in st.settings.model_index():
+                                                        "type": "invalid_request_error"}})
+        idx = st.settings.model_index()
+        if alias not in idx and not is_auto_alias(alias):
             raise HTTPException(404, detail={"error": {"message": f"unknown model '{alias}'",
-                                                       "type": "invalid_request_error"}})
+                                                        "type": "invalid_request_error"}})
+        # Resolve auto-aliases before routing
+        resolved_alias = _resolve_auto_alias(alias, idx)
+        if resolved_alias != alias:
+            payload["model"] = resolved_alias
         out: dict = {}
         try:
             if payload.get("stream"):
@@ -465,8 +528,53 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except NoUpstream as e:
             raise HTTPException(503, detail={"error": {"message": str(e), "type": "server_error"}})
         except UpstreamError as e:
-            raise HTTPException(e.status, detail={"error": {"message": str(e.detail),
-                                                            "type": "upstream_error"}})
+            raise HTTPException(e.status, detail={"error": _upstream_error(e)})
+
+    # ---- Anthropic Messages API (the third surface) ------------------------
+    # /v1/messages is a different shape again, not an alias: `system` + `messages`
+    # with block content + `max_tokens` in, a content block list + `stop_reason`
+    # out, and a message_start/content_block_delta/message_stop SSE stream. The
+    # gateway serves it and translates against whatever the upstream speaks, so
+    # Anthropic-style clients (opencode / kilocode) can point at it as their
+    # anthropic baseURL and talk to any configured provider.
+    @app.post("/v1/messages", dependencies=dep)
+    async def messages(request: Request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, detail={"error": {
+                "message": "body must be an object", "type": "invalid_request_error"}})
+        payload = up.anthropic_request_to_chat(body)
+        alias = str(payload.get("model") or "")
+        if not alias:
+            raise HTTPException(400, detail={"error": {
+                "message": "model is required", "type": "invalid_request_error"}})
+        idx = st.settings.model_index()
+        if alias not in idx and not is_auto_alias(alias):
+            raise HTTPException(404, detail={"error": {
+                "message": f"unknown model '{alias}'",
+                "type": "invalid_request_error"}})
+        resolved_alias = _resolve_auto_alias(alias, idx)
+        if resolved_alias != alias:
+            payload["model"] = resolved_alias
+        out: dict = {}
+        try:
+            if payload.get("stream"):
+                slot, alias, t0, resp = await st.router.open_stream(payload)
+                hdr = {"x-socket-upstream": slot.provider.name,
+                       "x-router-upstream": slot.provider.name,
+                       **egress_headers(getattr(resp, "_sms_egress", ""))}
+                chat_sse = st.router.wrap_stream(slot, alias, t0, resp)
+                return StreamingResponse(
+                    up.chat_stream_to_anthropic_events(chat_sse, alias),
+                    media_type="text/event-stream", headers=hdr)
+            chat = await st.router.complete(payload, egress_out=out)
+            obj = up.chat_to_anthropic(chat, alias)
+            return JSONResponse(obj, headers=egress_headers(out.get("egress", "")))
+        except NoUpstream as e:
+            raise HTTPException(503, detail={"error": {"message": str(e),
+                                                       "type": "server_error"}})
+        except UpstreamError as e:
+            raise HTTPException(e.status, detail={"error": _upstream_error(e)})
 
     # ---- OpenAI Responses API (the second OpenAI surface) -----------------
     # /v1/chat/completions and /v1/responses are different shapes, not aliases:
@@ -485,10 +593,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not alias:
             raise HTTPException(400, detail={"error": {
                 "message": "model is required", "type": "invalid_request_error"}})
-        if alias not in st.settings.model_index():
-            raise HTTPException(404, detail={"error": {
-                "message": f"unknown model '{alias}'",
-                "type": "invalid_request_error"}})
+        idx = st.settings.model_index()
+        if alias not in idx and not is_auto_alias(alias):
+            raise HTTPException(404, detail={"error": {"message": f"unknown model '{alias}'",
+                                                        "type": "invalid_request_error"}})
+        # Resolve auto-aliases before routing
+        resolved_alias = _resolve_auto_alias(alias, idx)
+        if resolved_alias != alias:
+            payload["model"] = resolved_alias
         out: dict = {}
         try:
             if payload.get("stream"):
@@ -504,16 +616,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             chat = await st.router.complete(payload, egress_out=out)
             obj = up.chat_to_responses_obj(chat, alias)
             store = st.responses_store
-            while len(store) >= RESPONSE_STORE_MAX:
-                store.pop(next(iter(store)), None)
-            store[obj["id"]] = obj
+            store_bytes = st._responses_store_bytes
+            obj_size = len(json.dumps(obj, default=str).encode("utf-8"))
+            if obj_size <= RESPONSE_STORE_MAX_BYTES and store_bytes + obj_size <= RESPONSE_STORE_MAX_BYTES:
+                while len(store) >= RESPONSE_STORE_MAX:
+                    old = store.pop(next(iter(store)))
+                    store_bytes -= len(json.dumps(old, default=str).encode("utf-8"))
+                store[obj["id"]] = obj
+                store_bytes += obj_size
+                st._responses_store_bytes = store_bytes
             return JSONResponse(obj, headers=egress_headers(out.get("egress", "")))
         except NoUpstream as e:
             raise HTTPException(503, detail={"error": {"message": str(e),
                                                        "type": "server_error"}})
         except UpstreamError as e:
-            raise HTTPException(e.status, detail={"error": {"message": str(e.detail),
-                                                            "type": "upstream_error"}})
+            raise HTTPException(e.status, detail={"error": _upstream_error(e)})
 
     @app.get("/v1/responses/{response_id}", dependencies=dep)
     async def responses_get(response_id: str):
@@ -632,13 +749,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except SMSocketBusy as e:
             return busy(e)
         except UpstreamError as e:
-            raise HTTPException(e.status, detail={"error": {"message": str(e.detail),
-                                                            "type": "upstream_error"}})
+            raise HTTPException(e.status, detail={"error": _upstream_error(e)})
 
     @app.get("/pool")
     async def pool():
-        return {"strategy": st.settings.strategy, "retry": st.settings.retry,
-                "cooldown": st.settings.cooldown, "slots": st.pool.stats()}
+        return {"strategy": st.settings.strategy, "cooldown": st.settings.cooldown,
+                "slots": st.pool.stats()}
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(request: Request):
@@ -700,6 +816,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if st.assessor is not None:
             st.assessor.start()
         st.build_tuner()                       # cancel-first, then start
+        # DSM 去抖收口：热重载前把旧 store 的脏水位/schema 落盘
+        try:
+            if dsm._sessions is not None:
+                dsm._sessions.close()
+            if dsm._schemas is not None:
+                dsm._schemas.flush()
+        except Exception:
+            pass
         bind_dsm(st)                           # dsm: block may have moved paths/tiers
         bind_egc(st)                           # egc: profile / lane whitelist may have moved
         log.info("reloaded: %d providers, %d keys", len(new.providers), len(st.pool.slots))

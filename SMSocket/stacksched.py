@@ -194,17 +194,25 @@ class StackScheduler:
         return self.enabled and reason in self.cfg.park_on
 
     # -- headroom -----------------------------------------------------------
-    def rpm_headroom(self, provider: str) -> int | None:
-        """Requests the provider may still send this minute (None = uncapped)."""
+    def rpm_headroom(self, provider: str, alias: str | None = None) -> int | None:
+        """Requests the provider may still send this minute (None = uncapped).
+
+        `alias` scopes the cooldown check so a key cooling for one model is still
+        counted as having rpm headroom for a sibling model under the same provider.
+        """
         if self.pool is None or not provider:
             return None
         now = time.time()
         best = None
         for slot in getattr(self.pool, "slots", []):
             p = slot.provider
-            if p.name != provider or not p.enabled or not slot.key:
+            if p.name != provider or not p.enabled:
                 continue
-            if now < slot.dead_until:               # cooling down: no use waking
+            # A keyless provider (OpenCode free models) has no credential: its
+            # single slot carries an empty key and still counts as usable.
+            if not slot.key and not getattr(p, "keyless", False):
+                continue
+            if slot.cooled(now, alias):                # cooling down: no use waking
                 continue
             room = slot.rpm_headroom(now)
             if room is None:
@@ -212,9 +220,28 @@ class StackScheduler:
             best = room if best is None else max(best, room)
         return best
 
-    def rpm_blocked(self, provider: str) -> bool:
-        room = self.rpm_headroom(provider)
+    def rpm_blocked(self, provider: str, alias: str | None = None) -> bool:
+        room = self.rpm_headroom(provider, alias)
         return room is not None and room <= 0
+
+    def provider_cooling(self, provider: str, alias: str | None = None) -> bool:
+        """True when every live key slot for this provider is in cooldown.
+
+        Scoped to `alias` (or every alias when None): a provider is "cold" for
+        model A only if all its keys are cooling for A, so model B can still be
+        served by a key that is merely cooling for A. This is the
+        `NoUpstream` cause the operator actually hits: a free-tier upstream
+        returns 429/503, smsocket cools the slot down, and the next request for
+        that alias finds zero candidates.
+        """
+        if self.pool is None or not provider:
+            return False
+        now = time.time()
+        slots = [s for s in getattr(self.pool, "slots", [])
+                 if s.provider.name == provider and s.provider.enabled and s.key]
+        if not slots:
+            return False
+        return all(s.cooled(now, alias) for s in slots)
 
     async def take_slot(self, provider: str = "") -> bool:
         """Grab the admission slot for a woken caller (no double counting)."""
@@ -261,7 +288,9 @@ class StackScheduler:
         """
         woke = 0
         for entry in list(self.stack.candidates()):
-            if self.rpm_blocked(entry.provider):
+            if self.rpm_blocked(entry.provider, entry.alias):
+                continue
+            if self.provider_cooling(entry.provider, entry.alias):
                 continue
             if entry.grab and not await self.take_slot(entry.provider):
                 continue

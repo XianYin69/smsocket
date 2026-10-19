@@ -7,6 +7,7 @@ config.yaml
 usage.sqlite3
 *.sqlite3
 .env
+smsocket.env
 Dockerfile.local
 .idea/
 .vscode/
@@ -18,3 +19,5 @@ runtime/
 smsocket.identity
 Users/
 *.bak
+usage.sqlite3-shm
+usage.sqlite3-wal

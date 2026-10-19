@@ -131,7 +131,9 @@ def import_bundle(raw_path: str, config_path=None) -> ExtensionSpec:
         raise _err("扩展程序路径不能为空")
     bundle = Path(str(raw_path).strip()).expanduser()
     if not bundle.is_absolute():
-        bundle = (Path(config_path or ".").parent / bundle).resolve()
+        # relative paths resolve against the CWD (what an operator sees in the
+        # shell they launched the gateway from), not the config file's folder
+        bundle = (Path.cwd() / bundle).resolve()
     if not bundle.is_dir():
         raise _err("扩展程序目录不存在：%s" % bundle, 404)
     man = manifest(bundle)

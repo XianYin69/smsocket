@@ -24,6 +24,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import dsm
+from .providers import is_auto_alias, resolve_auto_alias
 from .router import NoUpstream, UpstreamError
 
 log = logging.getLogger("smssocket")
@@ -116,9 +117,20 @@ def build(st, dep, egress_hdr=None) -> APIRouter:
         alias = alias_of(env)
         if not alias:
             raise bad(400, "x['sms.model'] is required (model alias)", "invalid_dsm_envelope")
-        if alias not in st.settings.model_index():
+        idx = st.settings.model_index()
+        if alias not in idx and not is_auto_alias(alias):
             raise bad(404, f"unknown model '{alias}'", "invalid_request_error")
+        # Resolve auto-aliases before materialisation: the pool ranks providers by
+        # effective priority/weight and cooldown, so `auto` is not the first alias
+        # of the first provider in config.yaml.
+        if is_auto_alias(alias):
+            alias = resolve_auto_alias(st.pool, st.settings.strategy, alias)
+            if not alias:
+                raise bad(503, "no models available", "server_error")
         body = materialise(env, alias)
+        dmt = st.settings.dsm.default_max_tokens
+        if dmt and not body.get("max_tokens") and not body.get("max_completion_tokens"):
+            body["max_tokens"] = dmt          # config 兜底：客户端未限时不被提供商低默认截断
         out: dict = {}
         if (env.get("out") or "json") == "delta":
             body["stream"] = True
@@ -132,6 +144,7 @@ def build(st, dep, egress_hdr=None) -> APIRouter:
             raise bad(503, str(e), "server_error")
         except UpstreamError as e:
             raise bad(e.status, str(e.detail), "upstream_error")
+        alias = str(chat_body.get("model") or alias)   # smsocket 自动路由：计费/归因用解析后的真实模型
         resp_env = dsm.encode_response(chat_body, env, alias=alias,
                                        egress=out.get("egress", ""),
                                        cost=cost_of(alias, chat_body.get("usage")))
@@ -226,8 +239,9 @@ def build(st, dep, egress_hdr=None) -> APIRouter:
             raise bad(400, "body must be an object", "invalid_request_error")
         try:
             info = dsm.register_schema(str(raw.get("ref") or ""),
-                                       str(raw.get("system") or ""),
-                                       list(raw.get("tools") or []))
+                                        str(raw.get("system") or ""),
+                                        list(raw.get("tools") or []))
+            dsm.schemas().flush()   # 首帧登记后批量落盘：重启后引用真源不丢
         except dsm.Unsupported as e:
             raise bad(422, str(e), "dsm_schema_mismatch")
         return JSONResponse({"accepted": True, **info}, media_type=dsm.CTYPE)
@@ -251,6 +265,8 @@ def build(st, dep, egress_hdr=None) -> APIRouter:
         done = {str(x) for x in (env.get("x") or {}).get("sms.done_lanes") or []}
         plan = dsm.split_fan(env, done_lanes=done)
         alias = alias_of(env)
+        if is_auto_alias(alias):
+            alias = resolve_auto_alias(st.pool, st.settings.strategy, alias) or alias
         bodies, errs = [], []
         for sub in plan["requests"]:
             try:

@@ -2,6 +2,7 @@
 catalog caching, apply-to-config, async job + progress."""
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
@@ -9,9 +10,9 @@ import yaml
 
 from SMSocket.config import ProviderSpec, Settings, load_config
 from SMSocket.discover import (CHAT_PARAMS, Catalog, Discoverer, classify,
-                               models_url, parse_model_list)
+                                list_headers, models_url, parse_model_list)
 from SMSocket.gateway import create_app
-from SMSocket.providers import mask
+from SMSocket.providers import mask, learn_rate_limit
 from SMSocket.router import Router
 
 KEY = "sk-test"
@@ -19,8 +20,7 @@ H = {"Authorization": "Bearer " + KEY}
 
 
 def make_settings(tmp_path, **kw):
-    return Settings(listen="127.0.0.1:8000", master_keys=[KEY], strategy="priority",
-                    retry=0, cooldown=0.0, db_path=str(tmp_path / "usage.sqlite3"),
+    return Settings(listen="127.0.0.1:8000", master_keys=[KEY], strategy="priority", cooldown=0.0, db_path=str(tmp_path / "usage.sqlite3"),
                     providers=[ProviderSpec(name="VendorX", base_url="https://x.example/v1",
                                             keys=[KEY], models={"old-alias": "x-old"},
                                             priority=5)],
@@ -74,7 +74,6 @@ def upstream(serve=("x-old", "x-big", "x-small"), reject=("reasoning_effort", "t
 CFG = """listen: 127.0.0.1:8011
 db_path: "{db}"
 strategy: priority
-retry: 0
 cooldown: 0
 providers:
   - name: VendorX
@@ -331,7 +330,287 @@ def test_catalog_clear_route(tmp_path, monkeypatch):
     assert session(app, lambda c: c.get("/admin/models", headers=H)).json()["count"] == 0
 
 
+def test_catalog_delete_single_row(tmp_path, monkeypatch):
+    """DELETE /admin/models/{provider}/{model} drops one cached probe row only."""
+    app, st = make_app(tmp_path, upstream(), monkeypatch)
+    session(app, lambda c: c.post("/admin/discover", headers=H,
+                                  json={"providers": ["VendorX"], "probe_stream": False,
+                                        "timeout": 5.0}))
+    assert session(app, lambda c: c.get("/admin/models", headers=H)).json()["count"] == 3
+    r = session(app, lambda c: c.delete("/admin/models/VendorX/x-big", headers=H))
+    assert r.status_code == 200 and r.json()["deleted"] == 1
+    rows = session(app, lambda c: c.get("/admin/models", headers=H)).json()
+    assert rows["count"] == 2
+    assert all(m["model"] != "x-big" for m in rows["data"])
+    # the other two providers are untouched
+    # deleting again is a 404 (the row is gone)
+    assert session(app, lambda c: c.delete("/admin/models/VendorX/x-big",
+                                            headers=H)).status_code == 404
+    # an unknown provider/model is a 404 too
+    assert session(app, lambda c: c.delete("/admin/models/Ghost/ghost",
+                                            headers=H)).status_code == 404
+
+
+def test_tree_unpublished_models_carry_delete_action(tmp_path, monkeypatch):
+    """A probed-but-unpublished model shows alias: null and a cache-delete button."""
+    app, st = make_app(tmp_path, upstream(), monkeypatch)
+    session(app, lambda c: c.post("/admin/discover", headers=H,
+                                  json={"providers": ["VendorX"], "probe_stream": False,
+                                        "timeout": 5.0}))
+    prov = session(app, lambda c: c.get("/admin/provider-models", headers=H)).json()["data"][0]
+    byid = {x["upstream"]: x for x in prov["models"]}
+    assert byid["x-big"]["published"] is False and byid["x-big"]["alias"] is None
+    # published alias keeps published=True
+    assert byid["x-old"]["published"] is True and byid["x-old"]["alias"] == "old-alias"
+    # the console renders the tree; the unpublished row must offer a cache-delete
+    from SMSocket.dashboard import PAGE as html
+    assert "data-a=delmodel" in html
+    assert "删除缓存" in html
+    assert "取消拒绝" in html
+
+
+def test_delete_records_a_denial_and_skips_the_model_on_reprobe(tmp_path, monkeypatch):
+    """Deleting a cached probe row also denies that id: the next freshness pass
+    must not re-list and re-probe it, and the tree must show it as denied."""
+    app, st = make_app(tmp_path, upstream(), monkeypatch)
+    session(app, lambda c: c.post("/admin/discover", headers=H,
+                                  json={"providers": ["VendorX"], "probe_stream": False,
+                                        "timeout": 5.0}))
+    assert session(app, lambda c: c.get("/admin/models", headers=H)).json()["count"] == 3
+    r = session(app, lambda c: c.delete("/admin/models/VendorX/x-big", headers=H))
+    assert r.status_code == 200 and r.json()["deleted"] == 1 and r.json()["denied"] is True
+    assert st.catalog.denied() == {("VendorX", "x-big")}
+    assert session(app, lambda c: c.get("/admin/models", headers=H)).json()["count"] == 2
+
+    # the tree still lists the rejected id, flagged denied, with no probe row
+    prov = session(app, lambda c: c.get("/admin/provider-models", headers=H)).json()["data"][0]
+    byid = {x["upstream"]: x for x in prov["models"]}
+    assert byid["x-big"]["denied"] is True
+    assert byid["x-big"]["probed"] is False and byid["x-big"]["ok"] is False
+
+    # a second freshness pass would re-list x-big; the discoverer must skip it
+    d = Discoverer(st.settings, st.http, st.catalog)
+    rep = asyncio.run(d.probe_provider(st.settings.providers[0], probe_params=False,
+                                        probe_stream=False, timeout=5.0))
+    assert [m["model"] for m in rep["models"]] == ["x-old", "x-small"]
+    asyncio.run(d.http.aclose())
+
+
+def test_undeny_lets_the_discoverer_probe_again(tmp_path, monkeypatch):
+    app, st = make_app(tmp_path, upstream(), monkeypatch)
+    session(app, lambda c: c.post("/admin/discover", headers=H,
+                                  json={"providers": ["VendorX"], "probe_stream": False,
+                                        "timeout": 5.0}))
+    session(app, lambda c: c.delete("/admin/models/VendorX/x-big", headers=H))
+    assert st.catalog.denied() == {("VendorX", "x-big")}
+    r = session(app, lambda c: c.post("/admin/models/VendorX/x-big/undeny", headers=H))
+    assert r.status_code == 200 and r.json()["cleared"] == 1
+    assert st.catalog.denied() == set()
+    d = Discoverer(st.settings, st.http, st.catalog)
+    rep = asyncio.run(d.probe_provider(st.settings.providers[0], probe_params=False,
+                                        probe_stream=False, timeout=5.0))
+    assert "x-big" in [m["model"] for m in rep["models"]]
+    asyncio.run(d.http.aclose())
+
+
 def test_discover_requires_auth(tmp_path, monkeypatch):
     app, st = make_app(tmp_path, upstream(), monkeypatch)
     assert session(app, lambda c: c.post("/admin/discover", json={})).status_code == 401
     assert session(app, lambda c: c.get("/admin/models")).status_code == 401
+
+
+# ----------------------------------------------------------------- keyless ---
+CFG_KEYLESS = """listen: 127.0.0.1:8011
+db_path: "{db}"
+strategy: priority
+cooldown: 0
+providers:
+  - name: VendorX
+    base_url: https://x.example/v1
+    keyless: true
+    keys: []
+    models:
+      free-model: free-model
+    priority: 5
+"""
+
+
+def test_keyless_provider_probes_and_routes_without_credential(tmp_path, monkeypatch):
+    """A provider flagged keyless: no key, no Authorization header, still routable.
+
+    OpenCode serves its free models and its public /v1/models without any
+    credential - the gateway must not send a bogus ``Bearer `` token (which
+    makes the upstream reject the call) and must still route requests to it.
+    """
+    # upstream that answers 401 when an Authorization header is present
+    seen = {"auth": []}
+    async def h(request: httpx.Request) -> httpx.Response:
+        seen["auth"].append(request.headers.get("authorization") or "")
+        if request.url.path.endswith("/models") and request.method == "GET":
+            return httpx.Response(200, headers={"content-type": "application/json"}, json={
+                "object": "list",
+                "data": [{"id": "free-model", "object": "model", "owned_by": "opencode",
+                          "created": 1700000000}]})
+        body = json.loads(request.content)
+        if str(body.get("model")) != "free-model":
+            return httpx.Response(404, json={"error": {"message": "no such model"}})
+        return httpx.Response(200, json={
+            "id": "c", "object": "chat.completion", "model": body["model"],
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+    transport = httpx.MockTransport(h)
+
+    cfg = tmp_path / "config.yaml"
+    db = str(tmp_path / "usage.sqlite3").replace("\\", "/")
+    cfg.write_text(CFG_KEYLESS.replace(chr(123) + "db" + chr(125), db), encoding="utf-8")
+    monkeypatch.setenv("SMSSOCKET_CONFIG", str(cfg))
+    monkeypatch.setenv("SMSSOCKET_MASTER_KEY", KEY)
+    settings = load_config(cfg)
+    p = settings.providers[0]
+    assert p.keyless is True and p.keys == []
+    app = create_app(settings)
+    st = app.state.llm
+    st.http = httpx.AsyncClient(transport=transport)
+    st.router = Router(st.settings, st.pool, st.usage, st.http, st.gate)
+
+    # discovery: no Authorization header sent on the /models GET
+    session(app, lambda c: c.post("/admin/discover", headers=H,
+                                  json={"providers": ["VendorX"], "probe_stream": False,
+                                        "probe_params": False, "timeout": 5.0}))
+    assert seen["auth"][0] in (None, ""), seen["auth"]
+    rows = session(app, lambda c: c.get("/admin/models", headers=H)).json()
+    assert rows["count"] == 1 and rows["data"][0]["model"] == "free-model"
+    assert rows["data"][0]["ok"] is True
+
+    # the keyless slot is live: a client call routes through it without a key
+    r = session(app, lambda c: c.post("/v1/chat/completions", headers=H, json={
+        "model": "free-model",
+        "messages": [{"role": "user", "content": "hi"}]}))
+    assert r.status_code == 200, r.text
+    assert r.json()["choices"][0]["message"]["content"] == "ok"
+    # every upstream call was keyless (no Bearer header anywhere)
+    assert all(a in (None, "") for a in seen["auth"]), seen["auth"]
+
+
+def test_keyless_provider_not_probeable_without_flag(tmp_path, monkeypatch):
+    """A provider with no key and keyless:false is skipped, like before."""
+    st = make_settings(tmp_path)
+    st.providers[0].keys = []
+    d = Discoverer(st, httpx.AsyncClient(transport=upstream()))
+    rep = asyncio.run(d.probe_provider(st.providers[0], concurrency=4, timeout=5.0))
+    assert rep["error"] == "no api key configured"
+    asyncio.run(d.http.aclose())
+
+
+# ----------------------------------------------------------------- rpm -----
+def test_learn_rate_limit_from_standard_headers():
+    p = ProviderSpec(name="v", base_url="https://x/v1", keys=[KEY])
+    assert learn_rate_limit(p, {"x-ratelimit-limit-requests": "60"}, "") == 60
+    assert p.max_rpm == 60
+    # a lower learned value narrows an existing cap; a higher one does not loosen it
+    assert learn_rate_limit(p, {"x-ratelimit-limit-requests": "120"}, "") == 60
+    p2 = ProviderSpec(name="v", base_url="https://x/v1", keys=[KEY], max_rpm=30)
+    assert learn_rate_limit(p2, {"x-ratelimit-limit-requests": "120"}, "") == 30
+    assert learn_rate_limit(p2, {"x-ratelimit-limit-requests": "20"}, "") == 20
+
+
+def test_learn_rate_limit_from_error_messages():
+    p = ProviderSpec(name="v", base_url="https://x/v1", keys=[KEY])
+    cases = [
+        ("Rate limit exceeded: 20 rpm", 20),
+        ("You have exceeded your free tier limit of 20 requests/minute", 20),
+        ("rpm limit: 5", 5),
+        ("请求频率过高，每分钟限制 100 次", 100),
+        ("try again in 5 minutes", None),          # a wait window, not a rate
+        ("generic rate limited", None),            # nothing named -> nothing learned
+    ]
+    for msg, want in cases:
+        p.max_rpm = 0
+        assert learn_rate_limit(p, None, msg) == want, msg
+        assert p.max_rpm == (want or 0)
+
+
+def test_learn_rate_limit_header_beats_message():
+    p = ProviderSpec(name="v", base_url="https://x/v1", keys=[KEY])
+    assert learn_rate_limit(p, {"x-ratelimit-limit": "10"}, "limit of 99 rpm") == 10
+
+
+# --------------------------------------------------------------- opencode ---
+def test_opencode_style_sends_cli_identity_headers():
+    """OpenCode's free tier is gated behind the OpenCode CLI identity: a bare
+    Authorization header is not enough, the request has to look like the agent
+    talking to its own backend (User-Agent + x-opencode-* + a session id)."""
+    from SMSocket.discover import list_headers
+    from SMSocket.upstream import headers, _opencode_headers
+    p = ProviderSpec(name="opencode", base_url="https://opencode.ai/zen/v1",
+                     style="opencode", keys=[], keyless=True)
+    h = headers(p, "")
+    assert h["authorization"] == "Bearer public"
+    assert h["user-agent"] == "opencode/1.18.35"
+    assert h["x-opencode-client"] == "cli"
+    assert h["x-opencode-project"] == "global"
+    assert h["x-opencode-session"].startswith("ses_")
+    assert h["x-opencode-session-id"].startswith("ses_")
+    # a real key is forwarded instead of the public bearer
+    h2 = headers(p, "oc_sk-1234")
+    assert h2["authorization"] == "Bearer oc_sk-1234"
+    # the /models listing goes through the same gate
+    lh = list_headers(p, "")
+    assert lh["authorization"] == "Bearer public"
+    assert lh["user-agent"] == "opencode/1.18.35"
+    # the session id is minted the way the real client mints one: ms*0x1000+counter
+    ms = int(time.time() * 1000)
+    sid = int(_opencode_headers("")["x-opencode-session"][4:], 16)
+    want = ((ms << 12) | (ms & 0xF)) & 0xFFFFFFFFFFFF
+    # time may tick between the two reads; accept the current or next ms
+    want_next = (((ms + 1) << 12) | ((ms + 1) & 0xF)) & 0xFFFFFFFFFFFF
+    assert sid in (want, want_next)
+
+
+def test_probe_rate_limit_no_hits_leaves_cap_untouched():
+    """A burst that stays under the cap must not invent a limit: nothing learned,
+    provider keeps whatever it had (0 = unlimited), and live 429s remain the
+    source of truth that the router will pick up later."""
+    p = ProviderSpec(name="v", base_url="https://x/v1", keys=[KEY], models={"m": "m"})
+    settings = Settings(listen="127.0.0.1:8000", master_keys=[KEY],
+                        strategy="priority", cooldown=0.0,
+                        db_path="x.sqlite3", providers=[p])
+
+    async def h(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "c", "choices": []})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(h)) as c:
+            return await Discoverer(settings, c).probe_rate_limit(p, burst=4, timeout=5.0)
+
+    rep = asyncio.run(run())
+    assert rep["limit_hits"] == 0 and rep["max_rpm"] is None, rep
+    assert p.max_rpm == 0
+    """The burst crosses the cap; the provider's 429 carries the RPM and the
+    shared ProviderSpec learns it - the sliding-window limiter then enforces
+    it with no config edit and no restart."""
+    calls = [0]
+    limit_body = {"error": {"message": "Rate limit exceeded: 3 rpm for free accounts"}}
+
+    async def h(request: httpx.Request) -> httpx.Response:
+        calls[0] += 1
+        if calls[0] <= 3:
+            return httpx.Response(200, json={"id": "c", "object": "chat.completion",
+                                             "choices": []})
+        return httpx.Response(429, json=limit_body)
+
+    p = ProviderSpec(name="v", base_url="https://x/v1", keys=[KEY],
+                     models={"m": "m"})
+    settings = Settings(listen="127.0.0.1:8000", master_keys=[KEY],
+                       strategy="priority", cooldown=0.0,
+                       db_path="x.sqlite3", providers=[p])
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(h)) as c:
+            d = Discoverer(settings, c)
+            return await d.probe_rate_limit(p, burst=6, timeout=5.0, model="m")
+
+    rep = asyncio.run(run())
+    assert rep["limit_hits"] == 3 and rep["max_rpm"] == 3, rep
+    assert p.max_rpm == 3                                # written onto the spec

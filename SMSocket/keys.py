@@ -6,11 +6,14 @@ it in a file next to the config, reused on every restart / --reload subprocess.
 Set SMSSOCKET_NO_KEY=1 (run.py --no-key) to opt out and run unauthenticated.
 """
 from __future__ import annotations
+import logging
 import os
 import secrets
 from pathlib import Path
 
 from .config import envv
+
+log = logging.getLogger("smssocket.keys")
 
 KEY_FILE = "smsocket.key"
 LEGACY_KEY_FILE = "router.key"
@@ -68,7 +71,8 @@ def ensure_master_key(settings, config_path=None, rotate: bool = False) -> str:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(key + "\n", encoding="utf-8")
-    except OSError:
-        pass  # read-only media: the key still works for this process
+    except OSError as exc:
+        log.warning("master key not persisted (%s): the key only lives in this process "
+                    "- every restart mints a different one; fix the path's writability", exc)
     settings.master_keys = [key]
     return "generated"

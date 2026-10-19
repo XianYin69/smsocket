@@ -43,10 +43,13 @@ from .providers import Pool, mask
 from .router import Router
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,48}$")
-GLOBALS = ("listen", "strategy", "retry", "cooldown", "db_path", "log_level",
+# model alias: looser than provider names - dots, slashes, colons are common
+# (e.g. "gpt-4o-mini", "deepseek/chat", "qwen2.5:7b")
+ALIAS_RE = re.compile(r"^[^\s]{1,128}$")
+GLOBALS = ("listen", "strategy", "cooldown", "db_path", "log_level",
            "currency", "max_concurrency", "queue_wait", "per_provider_concurrency")
 P_FIELDS = ("base_url", "style", "weight", "priority", "timeout", "max_rpm",
-            "enabled", "models", "embeddings", "extra_headers")
+             "enabled", "models", "embeddings", "extra_headers", "keyless", "auto")
 
 
 def queue_discover(st, names: list[str]) -> str:
@@ -131,6 +134,7 @@ def prov_dict(p) -> dict:
     return {"name": p.name, "base_url": p.base_url, "style": p.style,
             "weight": p.weight, "priority": p.priority, "timeout": p.timeout,
             "max_rpm": p.max_rpm, "enabled": p.enabled,
+            "keyless": bool(getattr(p, "keyless", False)),
             "models": dict(p.models), "embeddings": dict(p.embeddings),
             "extra_headers": dict(p.extra_headers),
             "auto": bool(getattr(p, "auto", True)),
@@ -169,17 +173,30 @@ def clean_provider(item: dict, old=None) -> dict:
     prev = old or {}
     out = {"name": name, "base_url": base, "style": style,
            "keys": list(prev.get("keys") or []),
-           "models": _str_map(item.get("models"), "models") or dict(prev.get("models") or {}),
-           "embeddings": _str_map(item.get("embeddings"), "embeddings"),
-           "extra_headers": _str_map(item.get("extra_headers"), "extra_headers"),
+           # `models`/`embeddings`: an explicit value (even an empty dict, which
+           # the form sends when the operator cleared the box) is honoured as-is;
+           # only an *absent* field falls back to what the file already holds, so
+           # a partial PATCH or PUT can never wipe a list it never mentioned.
+           "models": _str_map(item.get("models"), "models")
+           if item.get("models") is not None else dict(prev.get("models") or {}),
+           "embeddings": _str_map(item.get("embeddings"), "embeddings")
+           if item.get("embeddings") is not None else dict(prev.get("embeddings") or {}),
+           "extra_headers": _str_map(item.get("extra_headers"), "extra_headers")
+           if item.get("extra_headers") is not None else dict(prev.get("extra_headers") or {}),
            "weight": int(item.get("weight", prev.get("weight", 1))),
            "priority": int(item.get("priority", prev.get("priority", 0))),
            "timeout": float(item.get("timeout", prev.get("timeout", 120.0))),
-           "max_rpm": int(item.get("max_rpm", prev.get("max_rpm", 0))),
-           "enabled": bool(item.get("enabled", prev.get("enabled", True))),
-           # auto: measured weight/priority may replace the typed ones
-           "auto": bool(item.get("auto", prev.get("auto", True)))}
-    return {k: v for k, v in out.items() if v not in ({}, [], "")}
+"max_rpm": int(item.get("max_rpm", prev.get("max_rpm", 0))),
+            "enabled": bool(item.get("enabled", prev.get("enabled", True))),
+            # keyless: a provider that needs no credential at all (OpenCode serves
+            # its free models and its public /v1/models without any key). The UI
+            # checkbox is the only writer; the config file may set it too.
+            "keyless": bool(item.get("keyless", prev.get("keyless", False))),
+            # auto: measured weight/priority may replace the typed ones
+            "auto": bool(item.get("auto", prev.get("auto", True)))}
+    # Drop only structurally-empty maps; falsy scalars (enabled: false, max_rpm: 0)
+    # are legitimate values and must survive the round-trip.
+    return {k: v for k, v in out.items() if not (isinstance(v, (dict, list)) and not v)}
 
 
 def apply_state(st) -> dict:
@@ -548,6 +565,59 @@ def build(st, dep) -> APIRouter:
                                                        "type": "invalid_request_error"}})
         keys.pop(idx)
         item["keys"] = keys
+        write_raw(path, data)
+        return {"ok": True, "applied": apply_state(st), "config": snapshot()}
+
+    @r.post("/admin/providers/{name}/models")
+    async def add_model(name: str, request: Request):
+        """Add or update one model alias on an existing provider.
+
+        `{"alias": "gpt-x", "upstream": "gpt-4o-mini", "embed": false}`.
+        `embed: true` writes into the provider's `embeddings` map instead of
+        `models`. An alias that already exists is overwritten (the operator
+        editing one model must not have to retype the whole comma list).
+        """
+        body = await request.json()
+        body = body if isinstance(body, dict) else {}
+        alias = str(body.get("alias") or "").strip()
+        upstream = str(body.get("upstream") or "").strip()
+        if not alias or not ALIAS_RE.match(alias):
+            raise HTTPException(400, detail={"error": {"message": "bad model alias",
+                                                       "type": "invalid_request_error"}})
+        if not upstream:
+            raise HTTPException(400, detail={"error": {"message": "upstream model id is required",
+                                                       "type": "invalid_request_error"}})
+        embed = bool(body.get("embed"))
+        path = cfg_path()
+        data = read_raw(path)
+        item = find(data.get("providers") or [], name)
+        table_key = "embeddings" if embed else "models"
+        table = dict(item.get(table_key) or {})
+        table[alias] = upstream
+        item[table_key] = table
+        write_raw(path, data)
+        queued = queue_discover(st, [name]) if not embed else "off"
+        return {"ok": True, "applied": apply_state(st), "config": snapshot(),
+                "auto_discover": queued}
+
+    @r.delete("/admin/providers/{name}/models/{alias}")
+    async def del_model(name: str, alias: str):
+        """Drop one model alias from a provider (looks in models, then embeddings)."""
+        path = cfg_path()
+        data = read_raw(path)
+        item = find(data.get("providers") or [], name)
+        removed = False
+        for table_key in ("models", "embeddings"):
+            table = dict(item.get(table_key) or {})
+            if alias in table:
+                table.pop(alias)
+                item[table_key] = table
+                removed = True
+                break
+        if not removed:
+            raise HTTPException(404, detail={"error": {
+                "message": f"no such model alias '{alias}' on provider '{name}'",
+                "type": "invalid_request_error"}})
         write_raw(path, data)
         return {"ok": True, "applied": apply_state(st), "config": snapshot()}
 

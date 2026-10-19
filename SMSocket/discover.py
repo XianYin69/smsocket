@@ -28,7 +28,7 @@ import httpx
 
 from . import upstream as up
 from .config import ProviderSpec, Settings
-from .providers import mask
+from .providers import mask, learn_rate_limit
 
 log = logging.getLogger("smssocket")
 
@@ -82,16 +82,32 @@ class ProbeResult:
                 "embeddings": self.embeddings}
 
 
+import re
+
+_V = re.compile(r"/v\d+$")
+
+
 def models_url(p: ProviderSpec) -> str:
     base = p.base_url.rstrip("/")
-    return base + "/models" if base.endswith("/v1") else base + "/v1/models"
+    return base + "/models" if _V.search(base) else base + "/v1/models"
 
 
 def list_headers(p: ProviderSpec, key: str) -> dict:
+    """Headers for GET /models - keyless providers (OpenCode free models) need no auth."""
     if p.style == "anthropic":
-        return {"x-api-key": key, "anthropic-version": up.ANTHROPIC_VERSION,
-                "content-type": "application/json"}
-    return {"authorization": f"Bearer {key}", "content-type": "application/json"}
+        h = {"anthropic-version": ANTHROPIC_VERSION, "content-type": "application/json"}
+        if key:
+            h["x-api-key"] = key
+        return h
+    if p.style == "opencode":
+        # the /models listing is also behind the CLI identity gate
+        h = up._opencode_headers(key)
+        h["content-type"] = "application/json"
+        return h
+    h = {"content-type": "application/json"}
+    if key:
+        h["authorization"] = f"Bearer {key}"
+    return h
 
 
 def parse_model_list(data) -> list[dict]:
@@ -114,6 +130,18 @@ def parse_model_list(data) -> list[dict]:
     return out
 
 
+def _err_msg(data) -> str:
+    """从响应里取错误消息，兼容 dict / str / None 三种 error 格式。"""
+    if not isinstance(data, dict):
+        return ""
+    err = data.get("error")
+    if isinstance(err, dict):
+        return str(err.get("message") or "")
+    if isinstance(err, str):
+        return err
+    return str(data.get("message") or "")
+
+
 def classify(status: int, message: str, param: str) -> str:
     """supported / rejected / unknown for one probed parameter."""
     m = (message or "").lower()
@@ -129,9 +157,11 @@ def classify(status: int, message: str, param: str) -> str:
 
 
 class Discoverer:
-    def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
+    def __init__(self, settings: Settings, client: httpx.AsyncClient,
+                 catalog: Catalog | None = None) -> None:
         self.s = settings
         self.http = client
+        self.catalog = catalog
 
     # ---- low level ---------------------------------------------------------
     async def _call(self, p: ProviderSpec, key: str, body: dict,
@@ -159,6 +189,19 @@ class Discoverer:
         except (httpx.RequestError, asyncio.TimeoutError, ValueError):
             return []
 
+    def _denied(self, provider: str) -> set:
+        """Model ids the operator rejected - the discoverer never probes them again.
+
+        The catalog lives in the same sqlite file as the usage log, so the
+        denial set is read fresh on every probe; a denial outlives the process.
+        """
+        if self.catalog is None:
+            return set()
+        try:
+            return {m for (_prov, m) in self.catalog.denied(provider)}
+        except Exception:                                            # noqa: BLE001
+            return set()
+
     # ---- one model ---------------------------------------------------------
     async def probe_model(self, p: ProviderSpec, key: str, model: str, *,
                           test_prompt: str, probe_params: bool, probe_stream: bool,
@@ -182,8 +225,7 @@ class Discoverer:
                 except Exception:
                     res.reply = ""
         else:
-            res.error = (data.get("error") or {}).get("message") or text[:200] \
-                if isinstance(data, dict) else text[:200]
+            res.error = _err_msg(data) or text[:200]
             return res                      # no point probing a model we cannot call
 
         if probe_params:
@@ -231,18 +273,25 @@ class Discoverer:
                              max_params: int = len(CHAT_PARAMS),
                              progress=None) -> dict:
         keys = [k for k in p.keys if k]
+        # A keyless provider (OpenCode serves its free models without any
+        # credential) is probed with an empty key - headers() then omits the
+        # Authorization header entirely instead of sending a bogus "Bearer ".
+        if not keys and getattr(p, "keyless", False):
+            keys = [""]
         if not keys:
             return {"provider": p.name, "error": "no api key configured", "models": []}
         sem = asyncio.Semaphore(max(1, concurrency))
+        denied = self._denied(p.name)
         listed = await self.list_models(p, keys[0], timeout)
-        ids = [m["id"] for m in listed]
+        ids = [m["id"] for m in listed if m["id"] not in denied]
         meta = {m["id"]: m for m in listed}
         if models:
             ids = [i for i in ids if i in set(models)] or list(models)
         elif only_listed and not ids:
-            ids = list(dict.fromkeys(list(p.models.values()) + list(p.embeddings.values())))
+            ids = [i for i in dict.fromkeys(list(p.models.values()) + list(p.embeddings.values()))
+                   if i not in denied]
         else:
-            ids = list(dict.fromkeys(ids + list(p.models.values())))
+            ids = [i for i in dict.fromkeys(ids + list(p.models.values())) if i not in denied]
         ids = ids[:max_models]
 
         async def one(model_id: str) -> ProbeResult:
@@ -276,7 +325,7 @@ class Discoverer:
                 "key": mask(keys[0]), "models": rows}
 
     async def _probe_embed(self, p: ProviderSpec, key: str, model: str,
-                           timeout: float) -> str:
+                            timeout: float) -> str:
         try:
             r = await self.http.post(up.embed_url(p), headers=up.headers(p, key),
                                      json={"model": model, "input": "ping"},
@@ -284,6 +333,75 @@ class Discoverer:
             return classify(r.status_code, r.text[:200], "embeddings")
         except (httpx.RequestError, asyncio.TimeoutError):
             return "unknown"
+
+    # ---- rate limit (RPM) learning -----------------------------------------
+    async def probe_rate_limit(self, p: ProviderSpec, *,
+                               burst: int = 40,
+                               timeout: float = 30.0,
+                               model: str | None = None,
+                               test_prompt: str = TEST_PROMPT) -> dict:
+        """Fire a controlled burst; when the provider answers 429, learn its RPM.
+
+        A free-tier cap of 20/min needs ~21 requests to hit, so `burst` (default
+        40) comfortably crosses it.  Every 429 is fed into `learn_rate_limit`,
+        which reads `x-ratelimit-limit*` headers first, then a figure named in
+        the error body, and writes the result onto `p.max_rpm` - the shared
+        ProviderSpec every key slot reads.  Returns a report:
+
+            {"provider": name, "burst": n, "limit_hits": k,
+             "max_rpm": learned or None, "detail": "..."}
+
+        When no 429 arrives within the burst the provider is below the cap at
+        this moment; the cap is left untouched (`max_rpm: None`), and live 429s
+        learned later by the router still take effect on their own.
+        """
+        keys = [k for k in p.keys if k]
+        # A keyless provider (OpenCode serves its free models without any
+        # credential) is probed with an empty key - headers() then omits the
+        # Authorization header entirely instead of sending a bogus "Bearer ".
+        if not keys and getattr(p, "keyless", False):
+            keys = [""]
+        if not keys:
+            return {"provider": p.name, "burst": 0, "limit_hits": 0,
+                    "max_rpm": None, "detail": "no api key configured"}
+        m = model or (next(iter(p.models.values()), p.name) if p.models else p.name)
+        body = {"model": m, "messages": [{"role": "user", "content": test_prompt}],
+                "max_tokens": 1}
+        sem = asyncio.Semaphore(8)
+
+        async def one(i: int):
+            async with sem:
+                t0 = time.time()
+                try:
+                    r = await self.http.post(up.chat_url(p), headers=up.headers(p, keys[0]),
+                                             json=body, timeout=timeout)
+                    detail = ""
+                    if r.status_code == 429:
+                        try:
+                            detail = str((r.json().get("error") or {}).get("message")
+                                         or r.text[:200])
+                        except ValueError:
+                            detail = r.text[:200]
+                        return {"i": i, "limit": True, "ms": round((time.time() - t0) * 1000, 1),
+                                "headers": r.headers, "detail": detail}
+                    return {"i": i, "limit": False,
+                            "ms": round((time.time() - t0) * 1000, 1)}
+                except (httpx.RequestError, asyncio.TimeoutError) as e:
+                    return {"i": i, "limit": False, "error": str(e)[:100]}
+
+        t0 = time.time()
+        out = await asyncio.gather(*[one(i) for i in range(burst)])
+        hits = [o for o in out if o.get("limit")]
+        learned: int | None = None
+        detail_msg = ""
+        for h in hits:
+            learned = learn_rate_limit(p, h.get("headers"), h.get("detail", ""))
+            detail_msg = str(h.get("detail", ""))[:200]
+            if learned is not None:
+                break
+        return {"provider": p.name, "burst": len(out), "limit_hits": len(hits),
+                "max_rpm": learned, "detail": detail_msg,
+                "wall_ms": round((time.time() - t0) * 1000, 1)}
 
     # ---- whole fleet -------------------------------------------------------
     async def run(self, providers: list[ProviderSpec], **kw) -> list[dict]:
@@ -298,6 +416,9 @@ class Discoverer:
 # ---- catalog (sqlite, same file as the usage log) -------------------------
 SCHEMA = """CREATE TABLE IF NOT EXISTS models(
   provider TEXT, model TEXT, data TEXT, ts REAL,
+  PRIMARY KEY(provider, model));
+CREATE TABLE IF NOT EXISTS denied(
+  provider TEXT, model TEXT,
   PRIMARY KEY(provider, model))"""
 
 
@@ -305,7 +426,13 @@ class Catalog:
     def __init__(self, path: str) -> None:
         self.con = sqlite3.connect(path, check_same_thread=False)
         self.con.row_factory = sqlite3.Row
-        self.con.execute(SCHEMA)
+        self.con.execute("PRAGMA journal_mode=WAL")
+        self.con.execute("PRAGMA busy_timeout=5000")
+        self.con.execute("PRAGMA synchronous=NORMAL")
+        for stmt in SCHEMA.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                self.con.execute(stmt)
         self.con.commit()
 
     def put(self, rows: list[dict]) -> int:
@@ -346,6 +473,44 @@ class Catalog:
             n = self.con.execute("DELETE FROM models").rowcount
         self.con.commit()
         return n
+
+    def delete(self, provider: str, model: str) -> int:
+        """Drop one cached probe row (provider, model) - the "未发布" delete path.
+
+        Unlike `clear` this is surgical: it removes the single id the operator
+        picked from the tree, leaving every other probed model of that provider
+        (and every other provider) alone.
+        """
+        n = self.con.execute(
+            "DELETE FROM models WHERE provider=? AND model=?", (provider, model)).rowcount
+        self.con.commit()
+        return n
+
+    def deny(self, provider: str, model: str) -> int:
+        """Remember that the operator rejected this model id.
+
+        Deleting the cached probe row is not enough: the next freshness pass
+        would re-list and re-probe it.  A row in `denied` makes the discoverer
+        skip that (provider, model) pair for good, until the operator clears
+        the denial with `undeny`.
+        """
+        self.con.execute(
+            "INSERT OR REPLACE INTO denied(provider, model) VALUES(?, ?)",
+            (provider, model))
+        self.con.commit()
+        return 1
+
+    def undeny(self, provider: str, model: str) -> int:
+        n = self.con.execute(
+            "DELETE FROM denied WHERE provider=? AND model=?", (provider, model)).rowcount
+        self.con.commit()
+        return n
+
+    def denied(self, provider: str = "") -> set:
+        """{(provider, model)} the operator has rejected - read once per probe."""
+        q = "SELECT provider, model FROM denied" + (" WHERE provider=?" if provider else "")
+        return {(r["provider"], r["model"]) for r in self.con.execute(
+            q, (provider,) if provider else ())}
 
     def close(self) -> None:
         self.con.close()
